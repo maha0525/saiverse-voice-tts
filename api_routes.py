@@ -22,7 +22,9 @@ auth gate.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import queue
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -159,6 +161,28 @@ async def get_audio(
 # ---------------------------------------------------------------------------
 # GET /audio/{message_id}/stream
 # ---------------------------------------------------------------------------
+#: consumer queue を 1 回待つときの上限 (秒)。
+#:
+#: 無期限の ``q.get()`` を ``run_in_executor`` に渡してはならない。渡すと worker
+#: thread は「作業中」のまま executor へ戻らず、次の二つが同時に壊れる:
+#:
+#:   1. クライアントが切断してリクエストが cancel されても、待っている thread は
+#:      残り続ける (別 thread で走る同期処理に asyncio の cancel は届かない)。
+#:   2. インタプリタ終了時、``concurrent.futures`` が ``atexit`` より前に走らせる
+#:      ``_python_exit`` がその thread を join し続けるため、ホストが ``atexit``
+#:      に登録した後始末に到達できず、プロセスが終了しなくなる。
+#:
+#: ``close_stream`` まで到達しなかったストリーム — 合成が始まらないまま
+#: subscribe された placeholder (``audio_stream.subscribe`` の subscribe-before-open)
+#: や、途中で失敗した合成 — が 1 本でも残れば終了印は永久に来ないので、
+#: 上の 2 は「いつか起きる」ではなく「起きる」。実際 2026-08-27 に SAIVerse
+#: バックエンドが Ctrl+C で終了せず、この待ちが 3 本残っていた。
+#:
+#: 待ちを刻めば worker thread は毎周 executor へ返るので、停止シグナルも cancel も
+#: 届くようになる。同じ理由から ``playback_worker`` の job queue も期限付きで待つ。
+_CONSUMER_POLL_INTERVAL = 0.5
+
+
 async def _stream_body(message_id: str) -> AsyncIterator[bytes]:
     """Yield MP3 bytes from the in-process broadcast stream as they arrive.
 
@@ -166,6 +190,9 @@ async def _stream_body(message_id: str) -> AsyncIterator[bytes]:
     the broadcast. The queue is seeded with frames already emitted so that
     multiple clients (browser + retry + curl 等) can all replay the full
     stream from the start.
+
+    The wait for each chunk is bounded by ``_CONSUMER_POLL_INTERVAL`` so that
+    the executor thread is never pinned by a stream that never closes.
     """
     q = subscribe_stream(message_id)
     if q is None:
@@ -176,8 +203,14 @@ async def _stream_body(message_id: str) -> AsyncIterator[bytes]:
         return
 
     loop = asyncio.get_event_loop()
+    next_chunk = functools.partial(q.get, True, _CONSUMER_POLL_INTERVAL)
     while True:
-        chunk = await loop.run_in_executor(None, q.get)
+        try:
+            chunk = await loop.run_in_executor(None, next_chunk)
+        except queue.Empty:
+            # まだ次の frame が来ていないだけ。ここで一度 await が返ることが
+            # 重要で、cancel の受け口と worker thread の解放を兼ねている。
+            continue
         if chunk is None:
             break
         yield chunk

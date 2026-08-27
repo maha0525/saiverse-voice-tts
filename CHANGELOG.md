@@ -4,6 +4,28 @@
 
 ## [Unreleased]
 
+### 音声ストリーム配信の待ちがホストの終了を止める問題を修正
+
+- `api_routes.py` の `_stream_body` が、consumer queue を無期限の `q.get()`
+  で待つ形のまま `run_in_executor` に渡していた。この worker thread は
+  「作業中」のまま executor へ戻らないので、二つが同時に壊れる。
+  - クライアントが切断してリクエストが cancel されても、待っている thread は
+    残る (別 thread で走る同期処理に asyncio の cancel は届かない)。
+  - インタプリタ終了時、`concurrent.futures` が `atexit` **より前** に走らせる
+    `_python_exit` がその thread を join し続けるため、ホストが `atexit` に
+    登録した後始末に到達できず、プロセスが終了しない。
+- `close_stream` まで到達しなかったストリーム — 合成が始まらないまま subscribe
+  された placeholder (subscribe-before-open) や、途中で失敗した合成 — が 1 本でも
+  残れば終了印は永久に来ないので、これは「いつか起きる」ではなく起きる。
+  2026-08-27、SAIVerse バックエンドが Ctrl+C で終了せず、この待ちが 3 本
+  残っていた (py-spy で MainThread が `_WorkItem.run` 内の `queue.get` で寝る
+  worker を join しているところを確認)。
+- 待ちを 0.5 秒ずつに刻み、worker thread が毎周 executor へ返るようにした。
+  `playback_worker` の job queue が既に取っている形と同じ。停止シグナルも
+  cancel も届くようになる。
+- 回帰テスト `tests/test_stream_body.py` を追加。旧実装ではこのテストの実行中に
+  pytest 自身が終了できなくなる。
+
 ### 再生成ボタンを常時押せるようにする
 
 - `addon.json`: `regenerate_audio` バブルボタンの `show_when` を
