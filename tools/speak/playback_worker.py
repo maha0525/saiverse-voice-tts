@@ -273,6 +273,63 @@ def _notify_audio_ready(
     )
 
 
+def notify_no_audio(
+    message_id: Optional[str],
+    reason: str,
+    pulse_id: Optional[str] = None,
+) -> None:
+    """「この吹き出しに音声は生まれない」を画面へ知らせる。
+
+    画面の音声ボタンは ``addon.json`` の ``show_when: "metadata_exists"`` で、
+    ``audio_path`` が立つまで回転する待ち表示を出している。音声が 1 件も作られ
+    なかった吹き出しでは ``audio_path`` が永久に来ないので、待ち表示が残り続ける
+    (SAIVerse 本体 ``AddonBubbleButtons.tsx``。時間切れの保険はあるが、5 分間
+    回り続ける)。
+
+    契約は ``unavailable_keys`` — **この吹き出しではもう立たないメタデータ鍵の
+    一覧**。``audio_path`` に空文字や null を入れて済ませない理由が二つある:
+    再生成ボタン (``regenerate``) は ``audio_path`` の値の変化を完了の合図に
+    しているので偽の値を置くと合図が壊れること、そして再生ボタンが「値はある
+    のに鳴らない」死んだボタンとして出てしまうこと。鍵の名前で言う形にすると、
+    画面側の規則はアドオン非依存のまま (「そのボタンが待っている鍵が一覧に
+    入っていたら待たない」) で済む。
+
+    後から手動の再生成で本当に音声が作られたら ``audio_path`` が立ち、画面は
+    実値のほうを優先するので、この知らせを取り消す必要はない。
+    """
+    if not message_id:
+        return
+    try:
+        from saiverse.addon_metadata import set_metadata  # type: ignore
+        set_metadata(
+            message_id=message_id,
+            addon_name=_ADDON_NAME,
+            key="unavailable_keys",
+            value=["audio_path", "audio_stream_url"],
+        )
+    except Exception as exc:
+        LOGGER.warning("notify_no_audio set_metadata failed for msg=%s: %s", message_id, exc)
+    try:
+        from saiverse.addon_events import emit_addon_event  # type: ignore
+        # event の data はそのままフロントの addonMetadata へマージされるので、
+        # 再読込を待たずに待ち表示が解ける。reason はログと将来の診断用。
+        event_data: Dict[str, Any] = {
+            "unavailable_keys": ["audio_path", "audio_stream_url"],
+            "audio_unavailable_reason": reason,
+        }
+        if pulse_id is not None:
+            event_data["pulse_id"] = pulse_id
+        emit_addon_event(
+            addon=_ADDON_NAME,
+            event="audio_unavailable",
+            message_id=message_id,
+            data=event_data,
+        )
+    except Exception as exc:
+        LOGGER.warning("emit_addon_event(audio_unavailable) failed for msg=%s: %s", message_id, exc)
+    LOGGER.debug("notify_no_audio: msg=%s reason=%s", message_id, reason)
+
+
 def _saiverse_home() -> Path:
     import os
     env = os.getenv("SAIVERSE_HOME")
@@ -664,6 +721,14 @@ class _TTSWorker:
                 "Streaming produced no audio for msg=%s (initial job=%s)",
                 message_id, state.initial_job_id,
             )
+            # state はあったのに一片も音が溜まらなかった回 (全 sub-text の合成が
+            # 失敗した等)。ここも audio_path が立たないまま終わるので、上の
+            # 「state が無い」回と同じ知らせを出して画面の待ち表示を解く。
+            notify_no_audio(
+                message_id,
+                "synthesis produced no audio for this message",
+                pulse_id=pulse_id,
+            )
             return False
 
         try:
@@ -707,14 +772,23 @@ class _TTSWorker:
     def _process(self, job: _Job) -> None:
         # Pipeline Streaming finalize-only signal: text="" + is_final=True
         # の job は 「合成は不要、 既存 _MessageState を閉じて wav 保存だけ」
-        # という SAIVerse 本体側の依頼。 既存 state があれば finalize、
-        # なければ noop で抜ける (= sub-speak が一度も来なかった message)。
+        # という SAIVerse 本体側の依頼。 既存 state があれば finalize する。
+        # state が無いのは、この message に声にする文が一度も来なかった回
+        # (本当に空・記号だけの吹き出し、または合成が失敗して state を捨てた
+        # 回)。黙って抜けると画面の音声ボタンが audio_path を待ち続けて回転し
+        # 続けるので、「この吹き出しに音声は無い」を知らせてから抜ける。
         if not job.text and job.is_final and job.message_id:
             state = self._message_states.get(job.message_id)
             if state is None:
                 LOGGER.debug(
-                    "finalize-only job for unknown msg=%s; ignoring",
+                    "finalize-only job for unknown msg=%s; "
+                    "telling the UI this bubble has no audio",
                     job.message_id,
+                )
+                notify_no_audio(
+                    job.message_id,
+                    "no voiceable text was streamed for this message",
+                    pulse_id=job.pulse_id,
                 )
                 return
             self._finalize_message_state(state, job.message_id, job.pulse_id)
