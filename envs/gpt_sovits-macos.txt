@@ -17,6 +17,8 @@ torchaudio==2.11.0
 opencc-python-reimplemented
 nltk
 huggingface_hub>=0.20
+# 推論の import 連鎖が matplotlib を読む (gpt_sovits-cuda.txt の注記を参照)
+matplotlib
 
 numpy
 scipy

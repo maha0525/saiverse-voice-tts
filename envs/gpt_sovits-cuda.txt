@@ -30,6 +30,10 @@ torchaudio==2.11.0+cu128
 opencc-python-reimplemented
 nltk
 huggingface_hub>=0.20
+# 推論の import 連鎖 (AR/modules/lr_schedulers.py) が matplotlib を読む。upstream の
+# requirements には無く gradio の依存として入っていたので、gradio を外した分を明示する
+# (隔離の通し確認 2026-10-05 で発見)
+matplotlib
 
 numpy
 scipy
