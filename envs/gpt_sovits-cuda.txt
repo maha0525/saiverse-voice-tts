@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*- (pip は非 ASCII のコメントを含む requirements をこの宣言が無いと読めないことがある)
 # GPT-SoVITS 専用の Python 環境 (Windows / Linux、NVIDIA GPU) に入れるパッケージ。
 #
 # アドオンカタログの導入で、addon.json の setup.steps の pip_install

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*- (pip は非 ASCII のコメントを含む requirements をこの宣言が無いと読めないことがある)
 # Core dependencies (always required by this pack).
 # アドオンカタログの導入では、これは SAIVerse 本体の venv に入る (本体の
 # requirements.lock を constraints にして)。ローカル合成エンジンのパッケージは
