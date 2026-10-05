@@ -31,7 +31,9 @@ def _prepare_sys_path() -> None:
     if not _EXTERNAL_REPO.exists():
         raise RuntimeError(
             f"Irodori-TTS repository not found at {_EXTERNAL_REPO}. "
-            "Run: python scripts/install_backends.py irodori"
+            "Irodori-TTS was not chosen when this addon was installed: add it from "
+            "the addon manager (re-open the setup options and choose Irodori-TTS), "
+            "or for a manual install run: python scripts/install_backends.py irodori"
         )
     sp = str(_EXTERNAL_REPO)
     if sp not in sys.path:
@@ -132,6 +134,75 @@ def _trim_tail_garbage(audio: np.ndarray, sample_rate: int, chars: int) -> np.nd
     return audio
 
 
+def _mps_available(torch_mod: Any) -> bool:
+    backends = getattr(torch_mod, "backends", None)
+    mps = getattr(backends, "mps", None) if backends is not None else None
+    try:
+        return bool(mps is not None and mps.is_available())
+    except Exception:
+        return False
+
+
+# 上流 Irodori-TTS で bf16 が使える device (inference_runtime の precision 判定)
+_BF16_DEVICES = ("cuda", "xpu")
+
+
+def _resolve_runtime_settings(
+    config: Dict[str, Any], *, cuda_available: bool, mps_available: bool
+) -> tuple[Dict[str, str], List[str]]:
+    """engine 設定から、上流の RuntimeKey に渡す device と precision を決める。
+
+    上流は使えない device (CUDA の無い機械での "cuda" 等) や、CUDA/XPU 以外での
+    bf16 を ValueError で拒む。config/default.json.template は NVIDIA GPU 向け
+    (cuda + bf16) なので、そのままでは Mac や GPU の無い機械で必ず失敗する。
+    ここで使える device へ落とし、落とした理由を返す (呼び出し側が WARNING に出す)。
+
+    - モデル: "cuda" が使えなければ MPS (Apple silicon)、それも無ければ CPU。
+      上流の既定の device 選択 (default_runtime_device) と同じ優先順
+    - コーデック: "cuda" が使えなければ CPU (上流の既定の codec_device)
+    - bf16 は CUDA/XPU のときだけ。それ以外では fp32
+    """
+    notes: List[str] = []
+
+    def _usable(dev: str) -> bool:
+        if dev.startswith("cuda"):
+            return cuda_available
+        if dev == "mps":
+            return mps_available
+        return True
+
+    device = str(config.get("device", "cuda"))
+    if not _usable(device):
+        fallback = "mps" if mps_available else "cpu"
+        notes.append(f"device={device} is unavailable; using {fallback}")
+        device = fallback
+    model_precision = str(
+        config.get("model_precision", "bf16" if device.startswith("cuda") else "fp32")
+    )
+    if model_precision == "bf16" and not device.startswith(_BF16_DEVICES):
+        notes.append(f"bf16 is not supported on {device}; using fp32")
+        model_precision = "fp32"
+
+    codec_device = str(config.get("codec_device", "cpu"))
+    if not _usable(codec_device):
+        notes.append(f"codec_device={codec_device} is unavailable; using cpu")
+        codec_device = "cpu"
+    codec_precision = str(config.get("codec_precision", "fp32"))
+    if codec_precision == "bf16" and not codec_device.startswith(_BF16_DEVICES):
+        notes.append(f"codec bf16 is not supported on {codec_device}; using fp32")
+        codec_precision = "fp32"
+
+    return (
+        {
+            "device": device,
+            "model_precision": model_precision,
+            "codec_device": codec_device,
+            "codec_precision": codec_precision,
+        },
+        notes,
+    )
+
+
 _SAMPLING_REQUEST_FIELDS = {
     "caption",
     "ref_latent",
@@ -196,10 +267,18 @@ class IrodoriEngine(TTSEngine):
 
         checkpoint = self.config.get("checkpoint", "Aratako/Irodori-TTS-500M-v2")
         codec_repo = self.config.get("codec_repo", "Aratako/Semantic-DACVAE-Japanese-32dim")
-        device = self.config.get("device", "cuda")
-        model_precision = self.config.get("model_precision", "bf16" if device == "cuda" else "fp32")
-        codec_device = self.config.get("codec_device", "cpu")
-        codec_precision = self.config.get("codec_precision", "fp32")
+        import torch  # type: ignore  # 上の import で読み込み済み
+        settings, notes = _resolve_runtime_settings(
+            self.config,
+            cuda_available=torch.cuda.is_available(),
+            mps_available=_mps_available(torch),
+        )
+        for note in notes:
+            LOGGER.warning("Irodori-TTS: %s", note)
+        device = settings["device"]
+        model_precision = settings["model_precision"]
+        codec_device = settings["codec_device"]
+        codec_precision = settings["codec_precision"]
 
         # 上流 InferenceRuntime は checkpoint をローカルファイルパスとして解釈する
         # ため、HF repo ID が指定された場合はここで model.safetensors を解決する。

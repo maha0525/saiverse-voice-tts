@@ -30,12 +30,46 @@ def _prepare_sys_path() -> None:
     if not _EXTERNAL_REPO.exists():
         raise RuntimeError(
             f"GPT-SoVITS repository not found at {_EXTERNAL_REPO}. "
-            "Run: python scripts/install_backends.py gpt_sovits"
+            "GPT-SoVITS was not chosen when this addon was installed: add it from "
+            "the addon manager (re-open the setup options and choose GPT-SoVITS), "
+            "or for a manual install run: python scripts/install_backends.py gpt_sovits"
         )
     for p in (_EXTERNAL_REPO, _EXTERNAL_REPO / "GPT_SoVITS"):
         sp = str(p)
         if sp not in sys.path:
             sys.path.insert(0, sp)
+
+
+def _mps_available(torch_mod: Any) -> bool:
+    backends = getattr(torch_mod, "backends", None)
+    mps = getattr(backends, "mps", None) if backends is not None else None
+    try:
+        return bool(mps is not None and mps.is_available())
+    except Exception:
+        return False
+
+
+def _resolve_device(
+    desired: str, *, cuda_available: bool, mps_available: bool
+) -> tuple[str, bool]:
+    """engine 設定の device から、実際に使う (device, is_half) を決める。
+
+    - "cuda": 使えれば半精度 (従来どおり)。使えなければ CPU
+    - "mps" (Apple silicon の GPU): 使えれば全精度。上流 GPT-SoVITS の半精度の
+      扱いは「CPU なら切る」だけで MPS を考慮していない (TTS_Config)。動作未確認の
+      Mac で数値が崩れる要因を増やさないよう、MPS では is_half を必ず切る。
+      使えなければ CPU
+    - それ以外 ("cpu" を含む): CPU、全精度
+
+    "cuda" が使えないときに MPS へ自動で切り替えはしない。上流の推論 WebUI も
+    MPS の自動選択をコメントアウトしていて (inference_webui_fast.py)、MPS は
+    設定で明示したときだけ使う。
+    """
+    if desired == "cuda" and cuda_available:
+        return "cuda", True
+    if desired == "mps" and mps_available:
+        return "mps", False
+    return "cpu", False
 
 
 @contextlib.contextmanager
@@ -106,6 +140,12 @@ class GPTSoVITSEngine(TTSEngine):
             return
         _prepare_sys_path()
 
+        if self.config.get("device") == "mps":
+            # MPS に未実装の演算を CPU で代行させる。torch の import より前に
+            # 立てる必要がある (子プロセスではここより前に torch を import しない)。
+            # 上流の inference_webui_fast.py にも同じ指定がコメントで残っている。
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
         # torchaudio 2.11+ (torch 2.11, Python 3.13) では set_audio_backend が
         # deprecated no-op になり、torchcodec が強制されるが Windows では
         # FFmpeg DLL 依存で動作しない。torchaudio.load を monkey-patch して
@@ -136,25 +176,30 @@ class GPTSoVITSEngine(TTSEngine):
             # tts_infer.yaml の全セクションで device: cpu がハードコードされている
             # ため、CUDA が利用可能でも CPU 推論になってしまう。
             # 上流ファイルを変更せず、ここで cfg を上書きして CUDA を有効化する。
-            # engine 設定の device ("cuda" 既定 / "cpu") で明示的に CPU も選べる
+            # engine 設定の device ("cuda" 既定 / "mps" / "cpu") で明示的に選べる
             # (Irodori-TTS の device と同じ扱い)。
             import torch  # type: ignore
             desired = self.config.get("device", "cuda")
-            if desired == "cuda" and torch.cuda.is_available():
-                cfg.device = "cuda"
-                cfg.is_half = True
-                LOGGER.info("Loading GPT-SoVITS TTS pipeline (CUDA, half precision)")
+            device, is_half = _resolve_device(
+                desired,
+                cuda_available=torch.cuda.is_available(),
+                mps_available=_mps_available(torch),
+            )
+            cfg.device = device
+            cfg.is_half = is_half
+            if device == desired:
+                LOGGER.info(
+                    "Loading GPT-SoVITS TTS pipeline (%s, %s precision)",
+                    device, "half" if is_half else "full",
+                )
             else:
-                cfg.device = "cpu"
-                cfg.is_half = False
-                if desired == "cuda":
-                    LOGGER.warning(
-                        "Loading GPT-SoVITS TTS pipeline (CPU, full precision) "
-                        "— CUDA requested but unavailable; inference will be very "
-                        "slow. Install CUDA-enabled torch for GPU acceleration."
-                    )
-                else:
-                    LOGGER.info("Loading GPT-SoVITS TTS pipeline (CPU, full precision)")
+                LOGGER.warning(
+                    "Loading GPT-SoVITS TTS pipeline (CPU, full precision) "
+                    "— %s requested but unavailable; inference will be very "
+                    "slow. Install a torch build for that device for GPU "
+                    "acceleration.",
+                    desired,
+                )
 
             self._tts = TTS(cfg)
 

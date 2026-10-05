@@ -1,0 +1,73 @@
+# GPT-SoVITS 専用の Python 環境 (Windows / Linux、NVIDIA GPU) に入れるパッケージ。
+#
+# アドオンカタログの導入で、addon.json の setup.steps の pip_install
+# (env: gpt_sovits, os: windows / linux) がこのファイルを入れる。専用環境なので
+# 本体の requirements.lock は constraints として渡らず、本体の venv も変わらない。
+#
+# 元: GPT-SoVITS の requirements.txt (commit 2d9193b0d3c0eae0c3a14d8c68a839f1bae157dc)。
+# 変えたところ:
+#   - gradio<5 を外した (WebUI 専用。推論の入口 TTS_infer_pack.TTS から辿れる範囲は
+#     gradio を import しない)
+#   - opencc と --no-binary=opencc を外し、opencc-python-reimplemented を入れた
+#     (opencc は Windows でソースビルドが通らない。scripts/install_backends.py の
+#     _strip_opencc_from_requirements と同じ理屈)
+#   - numpy<2.0 を外し、torchmetrics<=1.5 を >=1.5.2,<1.6 にした。numpy 1.x には
+#     Python 3.13 用の wheel が無く (1.26.4 は cp39〜cp312 だけ)、SAIVerse の推奨の
+#     Python 3.13 では入らない。torchmetrics 1.5.0 は numpy<2.0 を要求するが、
+#     1.5.2 以降は要求しない。numpy 2 系での GPT-SoVITS の合成は、本体 venv
+#     (numpy 2.5.2) で実績がある
+#   - nltk と huggingface_hub を明示した (scripts/setup_gpt_sovits_data.py が使う)
+#   - torch / torchaudio を CUDA 12.8 版に固定した (本体 venv で合成実績のある組)
+#   - torchvision は入れない: 固定 commit の GPT-SoVITS の .py に torchvision の
+#     import は無い (grep で確認。出てくるのは BigVGAN の README の conda の例だけ)
+#   - 上の以外の版指定 (pydantic<=2.10.6、transformers<=4.50、peft<0.18.0 等) は
+#     upstream のまま
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+
+opencc-python-reimplemented
+nltk
+huggingface_hub>=0.20
+
+numpy
+scipy
+tensorboard
+librosa==0.10.2
+numba
+pytorch-lightning>=2.4
+ffmpeg-python
+onnxruntime; platform_machine == "aarch64" or platform_machine == "arm64"
+onnxruntime-gpu; platform_machine == "x86_64" or platform_machine == "AMD64"
+tqdm
+funasr==1.0.27
+cn2an
+pypinyin
+pyopenjtalk>=0.4.1
+g2p_en
+modelscope
+sentencepiece
+transformers>=4.43,<=4.50
+peft<0.18.0
+chardet
+PyYAML
+psutil
+# jieba_fast は PyPI に wheel が無く (sdist だけ)、C コンパイラの無い環境では
+# 入らない。同梱の中継パッケージが、純 Python の jieba を jieba_fast の名前で
+# 提供する (shims/jieba_fast_shim/ を参照)
+./shims/jieba_fast_shim
+jieba
+split-lang
+fast_langdetect>=0.3.1
+wordsegment
+rotary_embedding_torch
+ToJyutping
+g2pk2
+ko_pron
+python_mecab_ko; sys_platform != 'win32'
+fastapi[standard]>=0.115.2
+x_transformers
+torchmetrics>=1.5.2,<1.6
+pydantic<=2.10.6
+ctranslate2>=4.0,<5
+av>=11

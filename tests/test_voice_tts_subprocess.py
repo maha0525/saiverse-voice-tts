@@ -24,7 +24,7 @@ _SPEAK_DIR = _PACK_ROOT / "tools" / "speak"
 
 from tools.speak.engine import subprocess_ipc as ipc  # noqa: E402
 from tools.speak.engine import subprocess_proxy  # noqa: E402
-from tools.speak.engine.subprocess_proxy import SubprocessGPTSoVITSEngine  # noqa: E402
+from tools.speak.engine.subprocess_proxy import SubprocessTTSEngine  # noqa: E402
 
 
 # 偽 worker: text="BOOM" でエラー、"HANG" で無応答、それ以外は 3 チャンク返す。
@@ -54,6 +54,13 @@ while True:
         continue
     if text == "HANG":
         time.sleep(30)
+        continue
+    if text == "WHOAMI":
+        # 起動の形を親へ返す: [--engine の値が irodori か, 環境変数の目印]
+        is_irodori = 1.0 if sys.argv[sys.argv.index("--engine") + 1] == "irodori" else 0.0
+        mark = float(os.environ.get("VOICE_TTS_FAKE_MARK", "0"))
+        write_frame(proto_out, encode_chunk(np.array([is_irodori, mark], dtype=np.float32), 32000))
+        write_frame(proto_out, encode_end())
         continue
     for i in range(3):
         write_frame(proto_out, encode_chunk(np.array([float(i)], dtype=np.float32), 32000))
@@ -108,9 +115,13 @@ class SubprocessProxyTests(unittest.TestCase):
         self._worker_path = Path(path)
         self._orig_worker = subprocess_proxy._WORKER_PATH
         subprocess_proxy._WORKER_PATH = self._worker_path
+        # 実機の ~/.saiverse に専用環境があっても使わない (偽 worker は今の Python で)
+        self._orig_resolve = subprocess_proxy.resolve_worker_python
+        subprocess_proxy.resolve_worker_python = lambda env_name: (sys.executable, None)
 
     def tearDown(self):
         subprocess_proxy._WORKER_PATH = self._orig_worker
+        subprocess_proxy.resolve_worker_python = self._orig_resolve
         try:
             self._worker_path.unlink()
         except OSError:
@@ -118,7 +129,7 @@ class SubprocessProxyTests(unittest.TestCase):
         os.environ.pop("VOICE_TTS_FAKE_IPC_DIR", None)
 
     def test_stream_yields_chunks(self):
-        eng = SubprocessGPTSoVITSEngine({})
+        eng = SubprocessTTSEngine("gpt_sovits", {})
         try:
             chunks = list(eng.synthesize_stream("hello", ref_audio="/x.wav"))
             self.assertEqual(len(chunks), 3)
@@ -128,7 +139,7 @@ class SubprocessProxyTests(unittest.TestCase):
             eng.close()
 
     def test_worker_error_propagates(self):
-        eng = SubprocessGPTSoVITSEngine({})
+        eng = SubprocessTTSEngine("gpt_sovits", {})
         try:
             with self.assertRaises(RuntimeError) as ctx:
                 list(eng.synthesize_stream("BOOM", ref_audio="/x.wav"))
@@ -141,7 +152,7 @@ class SubprocessProxyTests(unittest.TestCase):
         orig_frame = subprocess_proxy._FRAME_TIMEOUT
         subprocess_proxy._FIRST_LOAD_TIMEOUT = 1.5
         subprocess_proxy._FRAME_TIMEOUT = 1.5
-        eng = SubprocessGPTSoVITSEngine({})
+        eng = SubprocessTTSEngine("gpt_sovits", {})
         try:
             with self.assertRaises(RuntimeError):
                 list(eng.synthesize_stream("HANG", ref_audio="/x.wav"))
@@ -153,6 +164,42 @@ class SubprocessProxyTests(unittest.TestCase):
         finally:
             subprocess_proxy._FIRST_LOAD_TIMEOUT = orig_first
             subprocess_proxy._FRAME_TIMEOUT = orig_frame
+            eng.close()
+
+    def test_worker_gets_engine_name_and_resolved_env(self):
+        """--engine にエンジン名が渡り、解決した環境変数で子プロセスが起動する。"""
+        seen = []
+
+        def fake_resolve(env_name):
+            seen.append(env_name)
+            env = os.environ.copy()
+            env["VOICE_TTS_FAKE_MARK"] = "7"
+            return sys.executable, env
+
+        subprocess_proxy.resolve_worker_python = fake_resolve
+        eng = SubprocessTTSEngine("irodori", {})
+        try:
+            chunks = list(eng.synthesize_stream("WHOAMI", ref_audio="/x.wav"))
+            np.testing.assert_array_almost_equal(
+                chunks[0].audio, np.array([1.0, 7.0], dtype=np.float32)
+            )
+            self.assertEqual(seen, ["irodori"])
+        finally:
+            eng.close()
+
+    def test_env_error_stops_before_spawning(self):
+        """専用環境が壊れているときは子プロセスを作らずに、理由付きで失敗する。"""
+
+        def broken(env_name):
+            raise subprocess_proxy.WorkerEnvError("入れ直してください")
+
+        subprocess_proxy.resolve_worker_python = broken
+        eng = SubprocessTTSEngine("gpt_sovits", {})
+        try:
+            with self.assertRaises(subprocess_proxy.WorkerEnvError):
+                list(eng.synthesize_stream("hello", ref_audio="/x.wav"))
+            self.assertIsNone(eng._proc)
+        finally:
             eng.close()
 
 

@@ -1,0 +1,59 @@
+# GPT-SoVITS 専用の Python 環境 (macOS) に入れるパッケージ。動作未確認。
+#
+# アドオンカタログの導入で、addon.json の setup.steps の pip_install
+# (env: gpt_sovits, os: macos) がこのファイルを入れる。中身は gpt_sovits-cuda.txt と
+# 同じ考え方で (変えたところの理由はそちらの先頭を参照)、違いは二つだけ:
+#   - torch / torchaudio は PyPI の普通の版 (Mac の GPU (MPS) と CPU で動く)
+#   - onnxruntime-gpu は Mac 向けが無いので、普通の onnxruntime を入れる
+# (python_mecab_ko の行は cuda 側の「win32 以外」の条件を外して無条件にしてあるが、
+#  macOS では同じ意味)
+# torch 2.11.0 の Mac 向けの wheel は Apple silicon (arm64) だけ (PyPI で確認)。
+# Intel Mac ではこのファイルの導入が失敗する。
+# torchvision は入れない (固定 commit の GPT-SoVITS の .py に import が無い)。
+torch==2.11.0
+torchaudio==2.11.0
+
+opencc-python-reimplemented
+nltk
+huggingface_hub>=0.20
+
+numpy
+scipy
+tensorboard
+librosa==0.10.2
+numba
+pytorch-lightning>=2.4
+ffmpeg-python
+onnxruntime
+tqdm
+funasr==1.0.27
+cn2an
+pypinyin
+pyopenjtalk>=0.4.1
+g2p_en
+modelscope
+sentencepiece
+transformers>=4.43,<=4.50
+peft<0.18.0
+chardet
+PyYAML
+psutil
+# jieba_fast は PyPI に wheel が無く (sdist だけ)、C コンパイラの無い環境では
+# 入らない。同梱の中継パッケージが、純 Python の jieba を jieba_fast の名前で
+# 提供する (shims/jieba_fast_shim/ を参照)
+./shims/jieba_fast_shim
+jieba
+split-lang
+fast_langdetect>=0.3.1
+wordsegment
+rotary_embedding_torch
+ToJyutping
+g2pk2
+ko_pron
+python_mecab_ko
+fastapi[standard]>=0.115.2
+x_transformers
+torchmetrics>=1.5.2,<1.6
+pydantic<=2.10.6
+ctranslate2>=4.0,<5
+av>=11

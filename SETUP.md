@@ -1,6 +1,10 @@
 # SETUP
 
-## クイックスタート(Windows)
+> **正規の導入経路は SAIVerse のアドオンカタログです (v0.6.0〜)。** アドオン管理 → カタログ から導入すると、導入時に使う音声エンジン (OpenAI TTS / ElevenLabs、GPT-SoVITS、Irodori-TTS) を選べ、GPT-SoVITS と Irodori-TTS はエンジンごとの専用の Python 環境 (`~/.saiverse/addon_install/saiverse-voice-tts/envs/`) に入ります。本体の `.venv` のパッケージは変わりません。導入の中身は `addon.json` の `setup` (requirements は `envs/*.txt`、取得の処理は `scripts/make_default_config.py` / `scripts/setup_gpt_sovits_data.py` / `scripts/setup_irodori_data.py`) にあります。
+>
+> 以下の `setup.bat` の手順は、カタログを使わない手動・開発者向けの経路です。この経路では、すべてが本体の `.venv` に入ります。
+
+## クイックスタート(Windows、手動・開発者向け)
 
 前提: **SAIVerse 本体のセットアップ(`.venv` 作成まで)が完了していること**
 
@@ -15,7 +19,7 @@ setup.bat
 
 | ステップ | 内容 |
 |---|---|
-| 1/5 | パック依存 (numpy, sounddevice, soundfile, huggingface_hub, **lameenc**, **torchcodec**) を SAIVerse の `.venv` にインストール |
+| 1/5 | パック依存 (numpy, sounddevice, soundfile, huggingface_hub, **lameenc**) を SAIVerse の `.venv` にインストール |
 | 2/5 | `scripts/install_backends.py` 呼び出し — GPT-SoVITS を clone、上流 requirements.txt から `opencc` を自動除外、`opencc-python-reimplemented` 代替導入、重み(約4GB)を HuggingFace から DL、`fast_langdetect` キャッシュディレクトリ作成 |
 | 3/5 | `torch.cuda.is_available()` を確認し、CPU 版 torch が入っていれば `cu121` の CUDA 版を強制再導入 |
 | 4/5 | `sounddevice.query_devices()` で出力デバイスを列挙(サーバー側再生時のデバイス選択用) |
@@ -25,7 +29,7 @@ setup.bat
 
 > `lameenc` は PCM → MP3 エンコードに使用 (progressive 配信用)。PyPI の wheel に libmp3lame がバンドルされているため、Windows でも追加システム依存は不要です。
 >
-> `torchcodec` は Irodori-TTS の内部で呼ぶ `torchaudio.load` が torch 2.10+ 系で必要とします。GPT-SoVITS のみの運用でも事前にインストールしています(エンジン切替時に追加セットアップ不要にするため)。
+> `torchcodec` (Irodori-TTS の内部で呼ぶ `torchaudio.load` が torch 2.10+ 系で必要とする) は v0.6.0 で `requirements.txt` から外しました。`setup.bat irodori` では Irodori-TTS 自身の依存として入り、カタログ経由では Irodori-TTS の専用環境 (`envs/irodori-*.txt`) に入ります。
 
 ### セットアップ完了後の手動作業
 
@@ -275,7 +279,6 @@ python -m pip install -r requirements.txt
 - `soundfile>=0.12` — wav 入出力
 - `huggingface_hub>=0.20` — 重みダウンロード
 - `lameenc>=1.5` — PCM → MP3 progressive エンコーダ(クライアント配信)
-- `torchcodec>=0.10` — torchaudio.load バックエンド(Irodori で必要)
 
 ### 2. GPT-SoVITS の clone + 重み DL + 依存
 

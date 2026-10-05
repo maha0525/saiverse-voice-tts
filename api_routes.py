@@ -106,6 +106,29 @@ def has_active_stream(message_id: str) -> bool:
     return bool(mod.has_stream(message_id))
 
 
+def _resolve_audio_file(fs_path: str) -> Path | None:
+    """metadata の ``audio_file`` (合成時の絶対パス) から、いまの実ファイルを探す。
+
+    v0.6.0 で合成音声の保存先を旧来の ``user_data/voice/out/`` から
+    ``addon_data/saiverse-voice-tts/outputs/`` へ移した。旧来の場所の wav は
+    SAIVerse 本体の起動時の移行 (``saiverse/addon_migrations.py``) が outputs/ へ
+    移すが、移行前に記録した metadata の絶対パスは旧来の場所を指したまま残る。
+    記録どおりの場所に無ければ、同じファイル名を outputs/ で探す (ファイル名は
+    合成ジョブの ID なので、場所が変わっても一意)。
+    """
+    path = Path(fs_path)
+    if path.is_file():
+        return path
+    if path.suffix.lower() != ".wav":
+        return None
+    try:
+        from saiverse.addon_paths import get_addon_data_dir  # type: ignore
+    except ImportError:
+        return None
+    candidate = get_addon_data_dir(_ADDON_NAME) / "outputs" / path.name
+    return candidate if candidate.is_file() else None
+
+
 router = APIRouter()
 
 
@@ -143,8 +166,8 @@ async def get_audio(
     if not fs_path:
         raise HTTPException(status_code=404, detail="audio not yet available")
 
-    path = Path(str(fs_path))
-    if not path.exists():
+    path = _resolve_audio_file(str(fs_path))
+    if path is None:
         raise HTTPException(status_code=404, detail="audio file missing on disk")
 
     # filename を渡すと FastAPI が Content-Disposition: attachment をデフォルトで

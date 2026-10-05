@@ -497,7 +497,7 @@ cd $env:USERPROFILE\SAIVerse
 pip install torchcodec
 ```
 
-`setup.bat` の最新版(2026-04 以降)では自動インストール済み。古いパックで発生した場合は `setup.bat` を再実行するか上記コマンドで追加導入。
+`setup.bat` の最新版(2026-04 以降)では自動インストール済み。古いパックで発生した場合は `setup.bat` を再実行するか上記コマンドで追加導入。v0.6.0 以降、アドオンカタログで導入した場合は Irodori-TTS の専用環境 (`envs/irodori-*.txt`) に入るので、この症状は出ない想定 (出たら専用環境の Python で `-m pip install torchcodec`)。
 
 ### Irodori で `dtype mismatch` / `F.linear` エラー
 
@@ -548,15 +548,15 @@ python scripts\install_backends.py irodori
 
 **症状**: Irodori で「3 秒の音声の合成に 15〜20 秒かかる」。GPU は見えているのに遅い。
 
-**診断**: 内部ステージタイミングをログで確認。`decode_latent` が突出して遅いはず。
+**診断**: 内部ステージタイミングをログで確認。`decode_latent` が突出して遅いはず。アドオンカタログで導入した場合、Irodori-TTS のパッケージは専用環境にだけ入っているので、下の `python` は専用環境の Python (`%USERPROFILE%\.saiverse\addon_install\saiverse-voice-tts\envs\irodori\Scripts\python.exe`) に読み替える。
 ```powershell
 python -c "
 import sys; sys.path.insert(0, 'external/Irodori-TTS')
 from irodori_tts.inference_runtime import SamplingRequest
-from tools.speak.engine import create_engine
+from tools.speak.engine.irodori import IrodoriEngine
 import json
 c = json.load(open('config/default.json', encoding='utf-8'))
-e = create_engine('irodori', c['engines']['irodori'])
+e = IrodoriEngine(c['engines']['irodori'])
 e._lazy_load()
 import time
 t = time.time()
@@ -972,7 +972,7 @@ python -c "import requests; r = requests.get('http://127.0.0.1:8000/api/addon/ev
 |---|---|---|
 | metadata 先読みが動いていない | DevTools Network で `/api/addon/messages/.../metadata` リクエストを確認 | SAIVerse 本体を最新版に更新(page.tsx に prefetch 処理が必要) |
 | メタデータが DB に無い | 上記リクエストが 200 で空 | 新規発話で再テスト |
-| wav ファイルが GC で削除済み | `~/.saiverse/user_data/voice/out/` にファイルがあるか | `config/default.json` の `gc_hours` を延長(既定 24 時間) |
+| wav ファイルが GC で削除済み | `~/.saiverse/user_data/addon_data/saiverse-voice-tts/outputs/` (v0.5.x までは `~/.saiverse/user_data/voice/out/`) にファイルがあるか | `config/default.json` の `gc_hours` を延長(既定 24 時間) |
 
 ### ModuleNotFoundError: No module named 'lameenc'
 

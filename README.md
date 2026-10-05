@@ -16,7 +16,24 @@ SAIVerse 拡張パック。ペルソナが発話したテキストを、ペル�
 - **全てローカル推論** — 外部APIサーバ不要。インターネット接続は初回の重み DL 時のみ
 - **Markdown/URI 自動除去** — ペルソナ応答中のリンク URL やマークアップは読み上げない
 
-## クイックスタート(Windows)
+## 導入 (アドオンカタログ — 正規の経路)
+
+v0.6.0 から、SAIVerse の **アドオン管理 → カタログ** から導入できます (Windows / Linux / Mac)。導入時に「使う音声エンジンを選んでください」と訊かれるので、使うものを選びます (複数可):
+
+- **OpenAI TTS / ElevenLabs** — クラウド API。GPU 不要、API キーを入れるだけ
+- **GPT-SoVITS** — ローカル合成。数 GB をダウンロード。Windows / Linux は NVIDIA GPU 推奨、Mac は動作未確認 (Apple silicon のみ。Intel Mac 向けの torch 2.11 は配布されていない)
+- **Irodori-TTS** — 同上
+
+GPT-SoVITS と Irodori-TTS のパッケージ (torch など) は、SAIVerse 本体の Python 環境ではなく、**エンジンごとの専用の Python 環境** (`~/.saiverse/addon_install/saiverse-voice-tts/envs/`) に入ります。本体のパッケージの版は変わりません。合成はその専用環境の Python の別プロセスで動きます。あとからエンジンを足したくなったら、アドオン管理の「導入済み」から同じ質問を開き直して選択肢を追加します。
+
+導入後の **参照音声の配置** は、アドオン管理 UI の「参照音声」からアップロードします (ローカル合成のエンジンを使う場合)。
+
+- 合成した音声 (wav) の保存先は `~/.saiverse/user_data/addon_data/saiverse-voice-tts/outputs/` です (v0.5.x までは `~/.saiverse/user_data/voice/out/`)。
+- 以前 `setup.bat` で導入していた場合: カタログから更新すると、新しいエンジンは専用環境に入ります。`setup.bat` が本体の `.venv` に入れた torch などのパッケージは消されずに残ります (動作の妨げにはなりません)。
+
+## クイックスタート(Windows、手動・開発者向け)
+
+> アドオンカタログを使わずに手で入れる旧来の経路です。この経路では、エンジンのパッケージがすべて SAIVerse 本体の `.venv` に入ります (専用環境は作られません)。
 
 SAIVerse 本体のセットアップ完了後、このリポジトリを `expansion_data/` 配下に配置し `setup.bat` を実行するだけです。**既定では GPT-SoVITS のみ**を導入します(Irodori も使いたい場合は [Irodori-TTS を使う](#irodori-tts-を使う) を参照)。
 
@@ -30,7 +47,7 @@ setup.bat
 `setup.bat` は以下を全自動で行います:
 
 1. SAIVerse の `.venv` をアクティベート
-2. パック依存(`numpy` / `sounddevice` / `soundfile` / `huggingface_hub` / `lameenc` / `torchcodec`)をインストール
+2. パック依存(`numpy` / `sounddevice` / `soundfile` / `huggingface_hub` / `lameenc`)をインストール
 3. `install_backends.py` で GPT-SoVITS を clone + 依存インストール + 重み DL
 4. `torch` が CUDA 版であることを確認(そうでなければ `cu121` 版を自動再導入)
 5. 音声デバイス一覧を表示、参照音声ファイルの有無をチェック
@@ -51,6 +68,8 @@ Irodori-TTS は GPT-SoVITS と**別の声質傾向**を試したい場合や、�
 
 ### 1. エンジンを導入する
 
+アドオンカタログから入れた場合は、導入時の質問で Irodori-TTS を選ぶか、あとから「選択肢を追加」で足します。以下は手動 (`setup.bat`) の場合。
+
 既に GPT-SoVITS を導入済みでも、Irodori-TTS の追加は独立して実行できます:
 
 ```batch
@@ -63,7 +82,7 @@ setup.bat irodori
 `setup.bat irodori` が実行するのは:
 
 - `external/Irodori-TTS/` へ upstream repo を shallow clone
-- パック依存に `torchcodec>=0.10` を追加インストール(Irodori 内部の `torchaudio.load` が torch 2.10+ 系で必要とする)
+- Irodori-TTS を `pip install -e` (Irodori 自身の依存として `torchcodec` も入る。Irodori 内部の `torchaudio.load` が torch 2.10+ 系で必要とする)
 - HuggingFace から **重み 2 点を自動 DL**:
   - `Aratako/Irodori-TTS-500M-v2` (約 1.9GB、生成モデル本体)
   - `Aratako/Semantic-DACVAE-Japanese-32dim` (約 410MB、音声 codec)

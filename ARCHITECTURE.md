@@ -22,6 +22,8 @@ Background worker thread (_TTSWorker._run)
    │
    ├─ profile = get_profile(persona_id)           registry.json または UI アップロードから
    ├─ engine = create_engine(profile.engine)      初回のみ lazy load
+   │     (gpt_sovits / irodori は子プロセスの代理エンジン。子プロセスは
+   │      エンジン専用の Python 環境の Python で動く — docs/out_of_process.md)
    │
    ├─ [ストリーミング対応エンジン]
    │    └─ engine.synthesize_stream() → SynthesisChunk yield
@@ -35,7 +37,7 @@ Background worker thread (_TTSWorker._run)
               └─ audio_stream.push_complete(...)         ← 完成 MP3 を一括投入
    │
    ▼
-wav 保存 (~/.saiverse/user_data/voice/out/<job_id>.wav)
+wav 保存 (~/.saiverse/user_data/addon_data/saiverse-voice-tts/outputs/<job_id>.wav。v0.5.x までは ~/.saiverse/user_data/voice/out/)
 set_metadata(msg_id, audio_file, audio_stream_url)
 emit_addon_event("audio_ready") ───────► フロント client_action 発火
    │
@@ -203,7 +205,9 @@ Irodori-TTS (Aratako/Irodori-TTS-500M-v2) のアダプタ。**上流 API は一�
 
 **checkpoint 解決**: `RuntimeKey.checkpoint` は上流ではローカルファイルパスを想定しているが、アダプタ側で拡張子なしなら HF repo ID と判定して `hf_hub_download(repo_id=..., filename='model.safetensors')` で自動 DL する。
 
-**torchaudio.load と torchcodec**: Irodori 内部の `_load_audio` が `torchaudio.load` を呼ぶが、torch 2.10+ 系ではこれが `torchcodec` backend を要求する。パックの `requirements.txt` に `torchcodec>=0.10` を明示している。
+**torchaudio.load と torchcodec**: Irodori 内部の `_load_audio` が `torchaudio.load` を呼ぶが、torch 2.10+ 系ではこれが `torchcodec` backend を要求する。v0.6.0 からは Irodori-TTS の専用環境の requirements (`envs/irodori-*.txt`) に `torchcodec>=0.10` を明示している (パックの `requirements.txt` からは外した)。Irodori-TTS 自身は torchcodec を `<0.11` (torch 2.10 向け) に縛っていて、torch 2.11 の環境で torchcodec を読めないときは、Irodori 内部の `_load_audio` が soundfile に切り替える。
+
+**device の自動切り替え (v0.6.0)**: `config/default.json.template` は NVIDIA GPU 向け (`cuda` + `bf16`)。上流は使えない device や CUDA/XPU 以外での `bf16` を拒むので、アダプタ (`_resolve_runtime_settings`) が、CUDA が使えなければモデルを MPS (Apple silicon) → CPU へ、コーデックを CPU へ落とし、`bf16` を `fp32` にする (WARNING ログ付き)。
 
 ### `tools/speak/audio_stream.py`
 

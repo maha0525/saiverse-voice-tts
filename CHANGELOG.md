@@ -2,6 +2,70 @@
 
 日付は ISO 8601 形式(JST)。バージョン採番はまだ付与していないため、日付とマージコミットハッシュで識別。
 
+## [0.6.0] - 2026-10-05 — SAIVerse のアドオンカタログから導入できるようにする
+
+### 導入時に音声エンジンを選び、ローカル合成はエンジン専用の Python 環境に入れる
+
+- `addon.json` を manifest v2 にした (`manifest_version: 2`、`setup_version: 2`、
+  `data_subdirs`、`setup.options`、`setup.steps`)。導入時に「使う音声エンジン」を
+  訊き (複数選択: OpenAI TTS / ElevenLabs、GPT-SoVITS、Irodori-TTS)、選んだ
+  エンジンの step だけが走る。`setup_version` を 2 にしたのは、`setup` を持たない
+  旧形式が 1 と数えられ、手で入れた voice-tts をカタログから更新したときに
+  setup が走るようにするため。
+- GPT-SoVITS と Irodori-TTS のパッケージは、SAIVerse 本体の venv ではなく、
+  エンジンごとの専用の Python 環境 (`~/.saiverse/addon_install/saiverse-voice-tts/envs/
+  gpt_sovits|irodori/`) に入る。requirements は `envs/` に OS 別 (Windows・Linux は
+  CUDA 12.8 版の torch 2.11.0、Mac は PyPI の torch 2.11.0) で置いた。
+  - GPT-SoVITS 用は upstream (commit `2d9193b`) の requirements.txt を基に、
+    gradio (WebUI 専用) と opencc (Windows でビルドできない) を外し、
+    opencc-python-reimplemented・nltk・huggingface_hub を足した。numpy<2.0 は
+    Python 3.13 用の wheel が無く入らないので外し、それに合わせて torchmetrics を
+    1.5.2 以降 (numpy<2.0 を要求しない) にした。
+  - Irodori-TTS 用は upstream (commit `89f9d8f`) を `./external/Irodori-TTS` から
+    入れ、torchcodec を足した。
+- `setup.bat` がしていた処理を step とスクリプトに置き換えた:
+  `scripts/make_default_config.py` (設定ファイルのひな形のコピー)、
+  `scripts/setup_gpt_sovits_data.py` (GPT-SoVITS の重みと NLTK のデータ。NLTK の
+  データは専用環境の下に置き、アンインストールで消える)、
+  `scripts/setup_irodori_data.py` (Irodori-TTS の重み。HF のキャッシュを専用環境の
+  下に置く)。`setup.bat` は手動・開発者向けとして残す。
+- `requirements.txt` (本体の venv に入る) から `torchcodec` を外した
+  (Irodori-TTS の専用環境へ移した)。
+
+### Irodori-TTS も別プロセスで合成する
+
+- `create_engine("irodori")` も、GPT-SoVITS と同じく子プロセスの代理エンジンを
+  返すようにした。専用環境に入れたパッケージは本体プロセスでは import できない
+  ため。代理エンジンは `SubprocessTTSEngine(engine_name, config)` に一般化し、
+  子プロセス (`subprocess_worker.py`) は `--engine gpt_sovits|irodori` で動かす
+  エンジンを選ぶ。初回の待ち時間の上限は両エンジンとも `_FIRST_LOAD_TIMEOUT`。
+  子プロセスのログはエンジンごとに `voice_tts_worker_<engine>.log`。
+  `VOICE_TTS_IN_PROCESS=1` で本体プロセス内の合成に戻せるのは両エンジン共通。
+- 子プロセスを起動する Python: 専用環境があればその Python
+  (環境変数 `VIRTUAL_ENV`・`PATH`・`NLTK_DATA`・`HF_HOME` を専用環境に向ける)、
+  無ければ旧来の手動導入とみなして本体の Python。専用環境が本体の Python と
+  版ずれしていたら、本体の Python に黙って落とさず「アドオンを入れ直して
+  ください」の旨のエラーで止める。
+
+### device
+
+- GPT-SoVITS の `device` に `mps` (Apple silicon の GPU) を足した。MPS では
+  半精度を使わない。`cuda` が使えないときは従来どおり CPU (MPS へは自動で
+  切り替えない)。
+- Irodori-TTS は、設定の device が使えないとき (CUDA の無い機械での `cuda`) に、
+  モデルを MPS → CPU へ、コーデックを CPU へ落とし、`bf16` を `fp32` にする
+  (WARNING ログ付き)。従来は上流が ValueError で拒んで合成できなかった。
+  ひな形の設定 (cuda + bf16) のままの Mac や GPU の無い機械で動かすため。
+
+### 合成音声の保存先
+
+- 合成した wav の保存先を、アドオン永続データの規約の場所
+  `~/.saiverse/user_data/addon_data/saiverse-voice-tts/outputs/` に変えた
+  (v0.5.x までは `~/.saiverse/user_data/voice/out/`。SAIVerse 本体の外では
+  旧来の場所のまま)。旧来の場所の wav は SAIVerse 本体の起動時の移行が
+  outputs/ へ移す。移行前に記録された絶対パスは、配信 (`GET /audio/{id}`) が
+  同じファイル名を outputs/ で引き直す。
+
 ## [Unreleased]
 
 ### 音声ストリーム配信の待ちがホストの終了を止める問題を修正

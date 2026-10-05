@@ -1,0 +1,20 @@
+# Irodori-TTS 専用の Python 環境 (macOS) に入れるパッケージ。動作未確認。
+#
+# アドオンカタログの導入で、addon.json の setup.steps の pip_install
+# (env: irodori, os: macos) がこのファイルを入れる。考え方は irodori-cuda.txt と同じで、
+# 違いは torch / torchaudio が PyPI の普通の版 (Mac の GPU (MPS) と CPU で動く) で
+# あることだけ。Irodori-TTS の README も、Mac では PyPI の PyTorch で CPU か MPS を
+# 使うとしている。
+# torch 2.11.0 の Mac 向けの wheel は Apple silicon (arm64) だけ (PyPI で確認)。
+# Intel Mac ではこのファイルの導入が失敗する。
+torch==2.11.0
+torchaudio==2.11.0
+
+./external/Irodori-TTS
+# torchaudio.load の backend (torch 2.10 以降の torchaudio が要求する)
+torchcodec>=0.10
+# torchcodec が読めないとき、Irodori の _load_audio が soundfile に切り替える。
+# その切り替え先を暗黙依存にしない
+soundfile>=0.12
+numpy
+huggingface_hub>=0.20

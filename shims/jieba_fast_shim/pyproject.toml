@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jieba-fast-shim"
+version = "0.1.0"
+description = "jieba_fast の代わりに純 Python の jieba を同じ import 名で提供する中継パッケージ (saiverse-voice-tts 同梱)"
+requires-python = ">=3.9"
+dependencies = ["jieba"]
+
+[tool.setuptools]
+packages = ["jieba_fast"]

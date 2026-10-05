@@ -1,0 +1,25 @@
+# Irodori-TTS 専用の Python 環境 (Windows / Linux、NVIDIA GPU) に入れるパッケージ。
+#
+# アドオンカタログの導入で、addon.json の setup.steps の pip_install
+# (env: irodori, os: windows / linux) がこのファイルを入れる。step の作業
+# フォルダはアドオンのフォルダなので、./external/Irodori-TTS は直前の git_clone の
+# step が取得した Irodori-TTS (commit 89f9d8fbd4d51ea019867ee1197725ede1df13c5)。
+# Irodori-TTS 自身の依存 (transformers>=5、peft>=0.18、gradio>=5 等) は、その
+# pyproject.toml から入る。GPT-SoVITS とも本体の venv とも両立しないので、専用環境に入れる。
+#
+# torch / torchaudio は CUDA 12.8 版に固定 (本体 venv で合成実績のある組)。
+# Irodori-TTS の pyproject.toml は torchcodec を <0.11 に縛っている (torchcodec 0.10 は
+# torch 2.10 向け)。torch 2.11 の torchaudio.load が torchcodec を読めないときは、
+# Irodori-TTS の _load_audio が soundfile に切り替えて参照音声を読む。
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+
+./external/Irodori-TTS
+# torchaudio.load の backend (torch 2.10 以降の torchaudio が要求する)
+torchcodec>=0.10
+# torchcodec が読めないとき、Irodori の _load_audio が soundfile に切り替える。
+# その切り替え先を暗黙依存にしない
+soundfile>=0.12
+numpy
+huggingface_hub>=0.20

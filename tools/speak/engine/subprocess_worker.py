@@ -1,15 +1,19 @@
 """音声合成子プロセス本体。
 
 本体プロセス (SAIVerse) とは独立した素の Python プロセスとして起動され、
-GPT-SoVITS の本物の ``GPTSoVITSEngine`` を保持する。標準入力でリクエストを
-受け、標準出力に音声フレームを流す (プロトコルは subprocess_ipc を参照)。
+``--engine`` で指定されたローカル合成エンジン (``GPTSoVITSEngine`` /
+``IrodoriEngine``) の本物を保持する。標準入力でリクエストを受け、標準出力に
+音声フレームを流す (プロトコルは subprocess_ipc を参照)。
+
+アドオンカタログで導入した場合は、そのエンジン専用の Python 環境の Python で
+起動される (起動する側: subprocess_proxy.resolve_worker_python)。
 
 独立プロセスなので本体プロセスの GIL 競合の影響を受けない。また、本体の
 ``tools/`` パッケージを sys.path に入れないため、GPT-SoVITS 内部の
 ``from tools.X import`` は GPT-SoVITS 自身の ``tools/`` に解決され、本体側で
 必要だった addon_external_loader の名前空間リダイレクトは不要になる。
 
-起動: ``python subprocess_worker.py --config '<json>'``
+起動: ``python subprocess_worker.py --engine gpt_sovits|irodori --config '<json>'``
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ if str(_SPEAK_DIR) not in sys.path:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--engine", choices=("gpt_sovits", "irodori"), default="gpt_sovits")
     ap.add_argument("--config", default="{}")
     args = ap.parse_args()
 
@@ -39,12 +44,11 @@ def main() -> int:
 
     # 標準出力をバイナリ通信路として確保し、ライブラリの print / tqdm は
     # stderr に逃がす (GPT-SoVITS は stdout に大量に print するため、これを
-    # しないとプロトコルが壊れる)。stderr は親が errlog ファイルに転送する。
+    # しないとプロトコルが壊れる。Irodori-TTS も同じ扱い)。stderr は親が errlog ファイルに転送する。
     proto_out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
     proto_in = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
     sys.stdout = sys.stderr  # type: ignore[assignment]
 
-    from engine.gpt_sovits import GPTSoVITSEngine
     from engine.subprocess_ipc import (
         decode_request,
         encode_chunk,
@@ -55,8 +59,18 @@ def main() -> int:
         write_frame,
     )
 
-    engine = GPTSoVITSEngine(config)
-    print("voice-tts worker: started", file=sys.stderr, flush=True)
+    if args.engine == "irodori":
+        from engine.irodori import IrodoriEngine
+
+        engine = IrodoriEngine(config)
+    else:
+        from engine.gpt_sovits import GPTSoVITSEngine
+
+        engine = GPTSoVITSEngine(config)
+    print(
+        f"voice-tts worker: started (engine={args.engine}, python={sys.executable})",
+        file=sys.stderr, flush=True,
+    )
 
     while True:
         payload = read_frame(proto_in)

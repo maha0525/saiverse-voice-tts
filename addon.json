@@ -8,7 +8,126 @@
         "ja": "GPT-SoVITS / Irodori-TTS / OpenAI TTS / ElevenLabs によるペルソナ発話の音声合成と再生。GPU が無い環境でもクラウド API 経由で利用可能。バックエンドPCのスピーカーとブラウザの両方に配信可能。",
         "en": "Speech synthesis and playback for personas via GPT-SoVITS, Irodori-TTS, OpenAI TTS, and ElevenLabs. Works via cloud APIs on systems without GPUs. Streams to both backend PC speakers and web browsers."
     },
-    "version": "0.5.0",
+    "version": "0.6.0",
+    "manifest_version": 2,
+    "setup_version": 2,
+    "data_subdirs": {
+        "inputs": "参照音声",
+        "outputs": "合成した音声"
+    },
+    "setup": {
+        "options": [
+            {
+                "id": "engines",
+                "question": {
+                    "ja": "使う音声エンジンを選んでください (あとから『選択肢を追加』で足せます)",
+                    "en": "Choose the speech engines to use (you can add more later with \"Add options\")"
+                },
+                "multiple": true,
+                "choices": [
+                    {
+                        "id": "cloud",
+                        "label": {
+                            "ja": "OpenAI TTS / ElevenLabs (クラウド API。GPU 不要、API キーが必要)",
+                            "en": "OpenAI TTS / ElevenLabs (cloud APIs; no GPU needed, requires an API key)"
+                        },
+                        "default": true
+                    },
+                    {
+                        "id": "gpt_sovits",
+                        "label": {
+                            "ja": "GPT-SoVITS (ローカル合成。数 GB をダウンロード。Windows/Linux は NVIDIA GPU 推奨、Mac は動作未確認)",
+                            "en": "GPT-SoVITS (local synthesis; downloads several GB. NVIDIA GPU recommended on Windows/Linux; untested on Mac)"
+                        }
+                    },
+                    {
+                        "id": "irodori",
+                        "label": {
+                            "ja": "Irodori-TTS (ローカル合成。数 GB をダウンロード。Windows/Linux は NVIDIA GPU 推奨、Mac は動作未確認)",
+                            "en": "Irodori-TTS (local synthesis; downloads several GB. NVIDIA GPU recommended on Windows/Linux; untested on Mac)"
+                        }
+                    }
+                ]
+            }
+        ],
+        "steps": [
+            {
+                "name": "Voice TTS のパッケージ",
+                "type": "pip_install",
+                "requirements": "requirements.txt"
+            },
+            {
+                "name": "設定ファイルの用意",
+                "type": "python_script",
+                "script": "scripts/make_default_config.py"
+            },
+            {
+                "name": "GPT-SoVITS 本体の取得",
+                "type": "git_clone",
+                "url": "https://github.com/RVC-Boss/GPT-SoVITS.git",
+                "commit": "2d9193b0d3c0eae0c3a14d8c68a839f1bae157dc",
+                "dest": "external/GPT-SoVITS",
+                "when": {"engines": "gpt_sovits"}
+            },
+            {
+                "name": "GPT-SoVITS のパッケージ (NVIDIA GPU 用)",
+                "type": "pip_install",
+                "requirements": "envs/gpt_sovits-cuda.txt",
+                "env": "gpt_sovits",
+                "os": ["windows", "linux"],
+                "when": {"engines": "gpt_sovits"}
+            },
+            {
+                "name": "GPT-SoVITS のパッケージ (Mac 用)",
+                "type": "pip_install",
+                "requirements": "envs/gpt_sovits-macos.txt",
+                "env": "gpt_sovits",
+                "os": ["macos"],
+                "when": {"engines": "gpt_sovits"}
+            },
+            {
+                "name": "GPT-SoVITS のモデルの重みと辞書データの取得",
+                "type": "python_script",
+                "script": "scripts/setup_gpt_sovits_data.py",
+                "env": "gpt_sovits",
+                "when": {"engines": "gpt_sovits"}
+            },
+            {
+                "name": "Irodori-TTS 本体の取得",
+                "type": "git_clone",
+                "url": "https://github.com/Aratako/Irodori-TTS.git",
+                "commit": "89f9d8fbd4d51ea019867ee1197725ede1df13c5",
+                "dest": "external/Irodori-TTS",
+                "when": {"engines": "irodori"}
+            },
+            {
+                "name": "Irodori-TTS のパッケージ (NVIDIA GPU 用)",
+                "type": "pip_install",
+                "requirements": "envs/irodori-cuda.txt",
+                "env": "irodori",
+                "os": ["windows", "linux"],
+                "when": {"engines": "irodori"}
+            },
+            {
+                "name": "Irodori-TTS のパッケージ (Mac 用)",
+                "type": "pip_install",
+                "requirements": "envs/irodori-macos.txt",
+                "env": "irodori",
+                "os": ["macos"],
+                "when": {"engines": "irodori"}
+            },
+            {
+                "name": "Irodori-TTS のモデルの重みの取得",
+                "type": "python_script",
+                "script": "scripts/setup_irodori_data.py",
+                "env": "irodori",
+                "when": {"engines": "irodori"}
+            }
+        ]
+    },
+    "uninstall": {
+        "steps": []
+    },
     "params_schema": [
         {
             "key": "auto_speak",
@@ -21,7 +140,7 @@
         {
             "key": "engine",
             "label": "TTS エンジン",
-            "description": "ペルソナの音声合成エンジン。gpt_sovits / irodori は GPU 必須のローカル合成 (参照音声を使う)。openai_tts / elevenlabs はクラウド API で GPU 不要 (それぞれ OpenAI 音声 / ElevenLabs Voice ID を指定)。未選択時は gpt_sovits。",
+            "description": "ペルソナの音声合成エンジン。gpt_sovits / irodori はローカル合成 (参照音声を使う。Windows/Linux は NVIDIA GPU 推奨、Mac は MPS か CPU で動かすが動作未確認) で、アドオンの導入時に選んだエンジンだけが使える (選んでいないエンジンを指定すると音声は作られない。あとからアドオン管理の『選択肢を追加』で足せる)。openai_tts / elevenlabs はクラウド API で GPU 不要 (それぞれ OpenAI 音声 / ElevenLabs Voice ID を指定)。未選択時は gpt_sovits。",
             "type": "dropdown",
             "default": "gpt_sovits",
             "options": ["gpt_sovits", "irodori", "openai_tts", "elevenlabs"],

@@ -100,3 +100,11 @@ CPU/GPU を割り当てるので、**本体プロセスの負荷が何であれ 
   無改造 (TTSEngine 公開 IF のみ使用)。テスト追加 (`tests/test_voice_tts_subprocess.py`
   7件: フレーム往復・ストリーム・エラー伝播・タイムアウト再起動) + 既存アドオン
   テスト 67件パス、ruff クリーン。**実機 (GPU + モデル) での end-to-end は未検証**。
+- 2026-10-05 (v0.6.0、アドオンカタログ対応): Irodori-TTS も別プロセスへ移した。
+  理由は GIL ではなく導入の形 — カタログ経由の導入では GPT-SoVITS と Irodori-TTS の
+  パッケージがエンジンごとの専用の Python 環境にだけ入り、本体プロセスでは import
+  できない。代理エンジンを `SubprocessTTSEngine(engine_name, config)` に一般化し、
+  子プロセスは `--engine gpt_sovits|irodori` で動かすエンジンを選ぶ (プロトコルは
+  不変。Irodori の文単位チャンキングは子プロセス側でそのまま動く)。子プロセスは
+  専用環境があればその Python で起動し (`resolve_worker_python`)、無ければ本体の
+  Python (旧来の手動導入)。子プロセスのログは `voice_tts_worker_<engine>.log`。

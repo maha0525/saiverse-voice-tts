@@ -338,7 +338,26 @@ def _saiverse_home() -> Path:
     return Path.home() / ".saiverse"
 
 
-_OUT_DIR = _saiverse_home() / "user_data" / "voice" / "out"
+#: 旧来の合成音声の保存先 (v0.5.x まで)。SAIVerse 本体の外 (スタンドアロン・
+#: テスト) ではここを使い続ける。
+LEGACY_OUT_DIR = _saiverse_home() / "user_data" / "voice" / "out"
+
+
+def _out_dir() -> Path:
+    """合成音声 (wav) の保存先 (作成はしない)。
+
+    SAIVerse 本体の中ではアドオン永続データの規約の場所
+    (``~/.saiverse/user_data/addon_data/saiverse-voice-tts/outputs/``)。
+    旧来の ``user_data/voice/out/`` の中身は、本体の起動時の移行
+    (``saiverse/addon_migrations.py``) が outputs/ へ移す。移行前に記録された
+    旧来の絶対パスは、配信側 (api_routes._resolve_audio_file) が outputs/ で
+    引き直す。import の時点ではフォルダを作らないよう、使うたびに解決する。
+    """
+    try:
+        from saiverse.addon_paths import get_addon_data_dir  # type: ignore
+    except ImportError:
+        return LEGACY_OUT_DIR
+    return get_addon_data_dir(_ADDON_NAME) / "outputs"
 
 
 @dataclass
@@ -454,8 +473,9 @@ class _TTSWorker:
 
     def _save_wav(self, audio: np.ndarray, sample_rate: int, job_id: str) -> Path:
         import wave
-        _OUT_DIR.mkdir(parents=True, exist_ok=True)
-        path = _OUT_DIR / f"{job_id}.wav"
+        out_dir = _out_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{job_id}.wav"
         clipped = np.clip(audio, -1.0, 1.0)
         pcm = (clipped * 32767.0).astype(np.int16)
         with wave.open(str(path), "wb") as wf:
@@ -759,10 +779,11 @@ class _TTSWorker:
     def _gc_old_files(self) -> None:
         cfg = self._load_config()
         hours = float(cfg.get("gc_hours", 24))
-        if hours <= 0 or not _OUT_DIR.exists():
+        out_dir = _out_dir()
+        if hours <= 0 or not out_dir.exists():
             return
         cutoff = time.time() - hours * 3600
-        for path in _OUT_DIR.glob("*.wav"):
+        for path in out_dir.glob("*.wav"):
             try:
                 if path.stat().st_mtime < cutoff:
                     path.unlink()
@@ -800,6 +821,7 @@ class _TTSWorker:
                 "No voice profile for persona_id=%s (and no _default); skipping TTS.",
                 job.persona_id,
             )
+            notify_no_audio(job.message_id, "no voice profile", pulse_id=job.pulse_id)
             return
 
         cfg = self._load_config()
@@ -808,6 +830,11 @@ class _TTSWorker:
             engine = self._get_engine(engine_name)
         except Exception as exc:
             LOGGER.error("Failed to initialize engine '%s': %s", engine_name, exc)
+            notify_no_audio(
+                job.message_id,
+                f"engine '{engine_name}' failed to initialize: {exc}",
+                pulse_id=job.pulse_id,
+            )
             return
 
         effective = _get_effective_params(job.persona_id)
@@ -870,6 +897,14 @@ class _TTSWorker:
             )
         except Exception as exc:
             LOGGER.error("TTS synthesis failed (engine=%s): %s", engine_name, exc)
+            # 導入時に選ばなかったエンジンを指定したときもここに来る (専用環境が
+            # 無く、子プロセス側の _prepare_sys_path が失敗する)。待ち表示を
+            # 回し続けない。
+            notify_no_audio(
+                job.message_id,
+                f"synthesis failed (engine={engine_name}): {exc}",
+                pulse_id=job.pulse_id,
+            )
             return
 
         wav_path: Optional[Path] = None

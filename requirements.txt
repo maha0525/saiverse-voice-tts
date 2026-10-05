@@ -1,4 +1,8 @@
-# Core dependencies (always required by this pack)
+# Core dependencies (always required by this pack).
+# アドオンカタログの導入では、これは SAIVerse 本体の venv に入る (本体の
+# requirements.lock を constraints にして)。ローカル合成エンジンのパッケージは
+# ここに書かない — 本体の venv と両立しないため、エンジン専用の Python 環境に入れる
+# (envs/*.txt。addon.json の setup.steps を参照)。
 numpy>=1.24
 sounddevice>=0.4.6
 soundfile>=0.12
@@ -9,22 +13,17 @@ huggingface_hub>=0.20
 # /audio/{message_id}/stream endpoint (browsers reject progressive WAV with
 # 0xFFFFFFFF header on iOS Safari / some Chromes).
 lameenc>=1.5
-# Irodori-TTS は ref_wav のロードに torchaudio.load を使う。最近の torch
-# (>=2.10 系) は backend に torchcodec を要求するため明示的にインストール。
-# GPT-SoVITS のみを使う場合は不要だが、両対応にしておく。
-torchcodec>=0.10
+# torchcodec (Irodori-TTS の torchaudio.load の backend) は v0.6.0 で
+# envs/irodori-*.txt へ移した。Irodori-TTS は専用環境の子プロセスで動く。
 
-# TTS backends are installed separately by setup.bat / install_backends.py.
-# Each backend clones its upstream repository into external/ and (where
-# applicable) runs `pip install -e .` on it. Backend-specific Python deps
-# (torch, transformers, etc.) are pulled in by each upstream's setup.
-#
-# Preferred entry point (Windows):
-#   setup.bat                    # installs gpt_sovits by default
-#   setup.bat irodori            # experimental
-#   setup.bat all
-#
-# Direct invocation (cross-platform):
-#   python scripts/install_backends.py gpt_sovits   # recommended
-#   python scripts/install_backends.py irodori
-#   python scripts/install_backends.py all
+# TTS backends:
+#   - アドオンカタログ (正規の導入経路): 導入時の質問で選んだエンジンだけが、
+#     addon.json の setup.steps によってエンジン専用の Python 環境に入る。
+#   - 手動・開発者向け (Windows): setup.bat。本体の venv に全部入れる旧来の形。
+#       setup.bat                    # installs gpt_sovits by default
+#       setup.bat irodori
+#       setup.bat all
+#   - Direct invocation (cross-platform, 旧来の形):
+#       python scripts/install_backends.py gpt_sovits
+#       python scripts/install_backends.py irodori
+#       python scripts/install_backends.py all
