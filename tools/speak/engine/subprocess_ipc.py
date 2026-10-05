@@ -26,9 +26,18 @@ _LEN = struct.Struct(">I")
 
 
 def write_frame(stream, payload: bytes) -> None:
-    """長さ付きフレームを書いて flush する。"""
-    stream.write(_LEN.pack(len(payload)))
-    stream.write(payload)
+    """長さ付きフレームを書いて flush する。
+
+    生 (unbuffered) のパイプへの書き込みは、要求より少ないバイト数だけ書いて
+    返ることがある (io.RawIOBase.write の仕様)。書き切るまで繰り返す —
+    途中で切れたフレームは、読み手が長さを読み違えて永遠に待つ事故になる。
+    """
+    view = memoryview(_LEN.pack(len(payload)) + payload)
+    while view:
+        written = stream.write(view)
+        if written is None:  # buffered な stream は全部書いて None を返す
+            break
+        view = view[written:]
     stream.flush()
 
 

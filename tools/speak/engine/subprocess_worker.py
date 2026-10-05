@@ -47,6 +47,12 @@ def main() -> int:
     # しないとプロトコルが壊れる。Irodori-TTS も同じ扱い)。stderr は親が errlog ファイルに転送する。
     proto_out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
     proto_in = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
+    # OS の fd 1 自体も stderr へ付け替える。sys.stdout の差し替えは Python の
+    # print しか守れず、C レベルで fd 1 へ直接書く部品 (初回だけの辞書・
+    # キャッシュ構築の知らせ等) の文章がフレームに混ざって、親がフレームの
+    # 長さを読み違えたまま永遠に待つ (2026-10-05 に Windows と Linux の両方で、
+    # その環境での初回の合成だけが刺さる形で実際に起きた)。
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.stdout = sys.stderr  # type: ignore[assignment]
 
     from engine.subprocess_ipc import (
