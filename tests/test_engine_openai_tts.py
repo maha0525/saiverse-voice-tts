@@ -17,7 +17,7 @@ import types
 import unittest
 from pathlib import Path
 from typing import Iterator, List
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 
