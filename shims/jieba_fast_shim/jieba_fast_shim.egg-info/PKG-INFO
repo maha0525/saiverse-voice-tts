@@ -1,6 +1,0 @@
-Metadata-Version: 2.4
-Name: jieba-fast-shim
-Version: 0.1.0
-Summary: jieba_fast の代わりに純 Python の jieba を同じ import 名で提供する中継パッケージ (saiverse-voice-tts 同梱)
-Requires-Python: >=3.9
-Requires-Dist: jieba

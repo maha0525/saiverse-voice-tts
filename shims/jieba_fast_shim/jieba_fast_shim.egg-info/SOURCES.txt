@@ -1,8 +1,0 @@
-pyproject.toml
-jieba_fast/__init__.py
-jieba_fast/posseg.py
-jieba_fast_shim.egg-info/PKG-INFO
-jieba_fast_shim.egg-info/SOURCES.txt
-jieba_fast_shim.egg-info/dependency_links.txt
-jieba_fast_shim.egg-info/requires.txt
-jieba_fast_shim.egg-info/top_level.txt
