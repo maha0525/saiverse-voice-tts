@@ -101,6 +101,12 @@
                 "when": {"engines": "irodori"}
             },
             {
+                "name": "Irodori-TTS の依存の手直し",
+                "type": "python_script",
+                "script": "scripts/patch_irodori_deps.py",
+                "when": {"engines": "irodori"}
+            },
+            {
                 "name": "Irodori-TTS のパッケージ (NVIDIA GPU 用)",
                 "type": "pip_install",
                 "requirements": "envs/irodori-cuda.txt",

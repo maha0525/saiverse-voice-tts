@@ -16,6 +16,10 @@
 torch==2.11.0+cu128
 torchaudio==2.11.0+cu128
 
+# Irodori-TTS の依存 dacvae は PyPI に無く、pyproject では名前だけ書かれて
+# 入手先 (GitHub) は uv 専用の欄 ([tool.uv.sources]) にある。pip はその欄を
+# 読まないので、ここで入手先を commit 固定で与える (隔離の通し確認で発見)
+dacvae @ git+https://github.com/facebookresearch/dacvae@414c20785fc3a28373073ea8ef7a1316eeeaca6e
 ./external/Irodori-TTS
 # torchaudio.load の backend (torch 2.10 以降の torchaudio が要求する)
 torchcodec>=0.10

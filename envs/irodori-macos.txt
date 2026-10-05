@@ -11,6 +11,8 @@
 torch==2.11.0
 torchaudio==2.11.0
 
+# dacvae の入手先は pip から見えない (irodori-cuda.txt の注記を参照)。commit 固定で与える
+dacvae @ git+https://github.com/facebookresearch/dacvae@414c20785fc3a28373073ea8ef7a1316eeeaca6e
 ./external/Irodori-TTS
 # torchaudio.load の backend (torch 2.10 以降の torchaudio が要求する)
 torchcodec>=0.10
