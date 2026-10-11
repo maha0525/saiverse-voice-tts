@@ -378,6 +378,45 @@ class RemoteWorkerTests(unittest.TestCase):
             engine.close()
 
 
+    def test_sample_voice_is_never_uploaded_under_a_persona_id(self):
+        """Config-file URL, empty UI, only registry _default: no GET/PUT, server profile used."""
+        from tools.speak import playback_worker as pw
+        from tools.speak import profiles, pronunciation_dict
+
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            sample = Path(tmp) / "default.wav"
+            sample.write_bytes(_wav())
+            worker = pw._TTSWorker()
+            worker._config_loaded = True
+            worker._config = {"engines": {"gpt_sovits": {"gpt_sovits_remote_url": "http://file.invalid"}}}
+            addon_config = types.ModuleType("saiverse.addon_config")
+            addon_config.get_params = lambda *args, **kwargs: {
+                "engine": "gpt_sovits", "streaming": False, "server_side_playback": False,
+                "gpt_sovits_remote_url": "", "gpt_sovits_remote_url_override": "",
+                "gpt_sovits_remote_timeout_sec": 15,
+            }
+            stack.enter_context(patch.dict(sys.modules, {"saiverse.addon_config": addon_config}))
+            stack.enter_context(patch.object(profiles, "_load_registry", return_value={
+                "_default": {"engine": "gpt_sovits", "ref_audio": str(sample), "ref_text": "見本"},
+            }))
+            stack.enter_context(patch.object(pw, "_worker", worker))
+            stack.enter_context(patch.object(pw, "_out_dir", return_value=Path(tmp)))
+            stack.enter_context(patch.object(pronunciation_dict, "apply", side_effect=lambda text, **kw: text))
+            stack.enter_context(patch.object(pw, "_notify_audio_ready"))
+            no_audio = stack.enter_context(patch.object(pw, "notify_no_audio"))
+            http = MagicMock()
+            http.post.return_value = _response(content=_wav())
+            stack.enter_context(patch("requests.Session", return_value=http))
+            worker._process(pw._Job(
+                text="hello", persona_id="synthetic", job_id="job", message_id="msg",
+            ))
+            no_audio.assert_not_called()
+            http.get.assert_not_called()
+            http.put.assert_not_called()
+            self.assertEqual(http.post.call_args.args[0], "http://file.invalid/synthesize")
+            self.assertEqual(http.post.call_args.kwargs["json"]["profile_id"], "synthetic")
+
+
 class RemoteProfileTests(unittest.TestCase):
     """profiles.get_profile with the UI loader for remote GPT-SoVITS personas."""
 

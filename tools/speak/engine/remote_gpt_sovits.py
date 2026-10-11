@@ -32,6 +32,9 @@ class RemoteGPTSoVITSEngine(TTSEngine):
     # The base adapter yields one completed WAV. This preserves the worker's
     # sub_seq/finalize path; the HTTP server itself does not stream inference.
     supports_streaming = True
+    # The reference audio passed to synthesize() is stored on the server under
+    # the persona's ID, so the worker must never pass the shared sample voice.
+    stores_reference_by_persona = True
 
     def __init__(self, engine_config: Dict[str, Any]):
         super().__init__(engine_config)

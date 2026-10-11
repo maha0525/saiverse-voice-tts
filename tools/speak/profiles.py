@@ -182,6 +182,9 @@ def get_profile(persona_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return server_only
     elif "_default" in registry:
         entry = dict(registry["_default"])
+        # 見本の声。ペルソナ ID でサーバーに声を登録するエンジンには渡さない
+        # (playback_worker が参照音声を外す)。
+        entry["is_default_voice"] = True
         LOGGER.debug("profile source=registry_default persona=%s", persona_id)
 
     if entry is None:

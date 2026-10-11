@@ -871,6 +871,16 @@ class _TTSWorker:
         synthesis_params = dict(profile.get("params") or {})
         if job.persona_id:
             synthesis_params["persona_id"] = job.persona_id
+        ref_audio = profile.get("ref_audio")
+        ref_text = profile.get("ref_text")
+        if profile.get("is_default_voice") and getattr(engine, "stores_reference_by_persona", False):
+            # 見本の声をこのペルソナの ID で外部サーバーに登録しない (共有サーバー
+            # 上の本人の声を上書きしうる)。サーバー登録済みのプロファイルで合成する。
+            LOGGER.debug(
+                "persona=%s has only the sample voice; using the server's profile as is",
+                job.persona_id,
+            )
+            ref_audio = ref_text = None
         LOGGER.debug(
             "effective addon params for persona=%s: streaming=%s server_side=%s enabled=%s",
             job.persona_id,
@@ -906,8 +916,8 @@ class _TTSWorker:
             ok = self._play_streaming(
                 engine=engine,
                 text=tts_text,
-                ref_audio=profile.get("ref_audio"),
-                ref_text=profile.get("ref_text"),
+                ref_audio=ref_audio,
+                ref_text=ref_text,
                 params=synthesis_params,
                 job_id=job.job_id,
                 message_id=job.message_id,
@@ -924,8 +934,8 @@ class _TTSWorker:
         try:
             result = engine.synthesize(
                 text=tts_text,
-                ref_audio=profile.get("ref_audio"),
-                ref_text=profile.get("ref_text"),
+                ref_audio=ref_audio,
+                ref_text=ref_text,
                 params=synthesis_params,
             )
         except Exception as exc:
