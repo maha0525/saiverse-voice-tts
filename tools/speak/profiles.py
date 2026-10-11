@@ -87,6 +87,7 @@ def _try_addon_persona_config(persona_id: Optional[str]) -> Optional[Dict[str, A
 
     プロファイルとして有効と判定する条件:
     - ローカルエンジン (gpt_sovits / irodori): ``ref_audio`` がセットされている
+    - 外部 GPT-SoVITS: URL がある (サーバーに登録済みの参照音声も利用可能)
     - API エンジン (openai_tts / elevenlabs): ``ref_audio`` 不要
       (ref_audio は無視される。代わりに voice / voice_id がエンジン側で必要)
 
@@ -106,7 +107,10 @@ def _try_addon_persona_config(persona_id: Optional[str]) -> Optional[Dict[str, A
         # ローカルエンジンは ref_audio がないとプロファイル成立とみなさない
         # (registry.json フォールバックに移行させる)。API エンジンは
         # ref_audio が無くてもプロファイル成立とする。
-        if engine not in _API_ENGINES and not ref_audio:
+        remote_gpt_sovits = engine == "gpt_sovits" and str(
+            params.get("gpt_sovits_remote_url") or ""
+        ).strip()
+        if engine not in _API_ENGINES and not remote_gpt_sovits and not ref_audio:
             return None
         ref_text = params.get("ref_text", "")
         # 以下は params に含めず除外:

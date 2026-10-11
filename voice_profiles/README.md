@@ -66,13 +66,20 @@ voice_profiles/
 | フィールド | 必須 | 説明 |
 |---|---|---|
 | `engine` | 必須 | `gpt_sovits`(既定) / `irodori` |
-| `ref_audio` | 必須 | `samples/` 以下の相対パス(絶対パスも可) |
+| `ref_audio` | ローカル合成で必須 | `samples/` 以下の相対パス(絶対パスも可)。外部 GPT-SoVITS にペルソナ ID のプロファイルが登録済みなら省略可能 |
 | `ref_text` | エンジン依存 | gpt_sovits は必須(wav の**正確な**書き起こし)。irodori は無視されるので空でよい |
 | `params` | 任意 | エンジン別の生成パラメータ(下記参照) |
 
 ### `params` に指定できる項目(エンジン別)
 
 #### gpt_sovits
+
+外部サーバー URL はアドオン管理 UI、または `config/default.json` の
+`engines.gpt_sovits.gpt_sovits_remote_url` に設定します。
+通信タイムアウトは同階層の `gpt_sovits_remote_timeout_sec` (既定 15 秒) です。
+UI 設定が存在する場合は UI が優先されます。外部サーバーに送る合成引数は
+ペルソナ ID とテキストのみで、下表のローカル推論パラメータは送信しません。
+
 | キー | 既定値 | 説明 |
 |---|---|---|
 | `speed` | 1.0 | 話速(0.5〜2.0) |

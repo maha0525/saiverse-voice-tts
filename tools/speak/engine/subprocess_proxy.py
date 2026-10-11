@@ -21,7 +21,7 @@ GPT-SoVITS と Irodori-TTS のパッケージは本体の venv とも互いと�
 
 設計判断は docs/out_of_process.md を参照:
 - 通信 = 標準入出力 (長さ付きフレーム)
-- 適用 = gpt_sovits / irodori は常に別プロセス (create_engine が本クラスを返す)
+- 適用 = ローカルの gpt_sovits / irodori (外部 GPT-SoVITS URL 設定時は HTTP)
 - 異常時 = 一定時間応答が無ければ失敗扱い + 子プロセス自動再起動
 """
 from __future__ import annotations

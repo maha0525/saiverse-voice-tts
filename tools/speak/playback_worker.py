@@ -422,6 +422,7 @@ class _TTSWorker:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._engines: Dict[str, TTSEngine] = {}
+        self._engine_transports: Dict[str, tuple] = {}
         # Pipeline Streaming で同 message_id の sub-text 群が共有する状態。
         # _process は 1 worker thread から逐次 access するので競合しないが、
         # 「is_final=True の job が完了した時に state を drop」 を確実にする
@@ -462,13 +463,23 @@ class _TTSWorker:
         self._config_loaded = True
         return self._config
 
-    def _get_engine(self, name: str) -> TTSEngine:
-        if name in self._engines:
-            return self._engines[name]
+    def _get_engine(self, name: str, effective: Optional[Dict[str, Any]] = None) -> TTSEngine:
         cfg = self._load_config()
-        engine_cfg = (cfg.get("engines") or {}).get(name, {})
+        engine_cfg = dict((cfg.get("engines") or {}).get(name, {}))
+        if name == "gpt_sovits":
+            for key in ("gpt_sovits_remote_url", "gpt_sovits_remote_timeout_sec"):
+                if effective is not None and key in effective:
+                    engine_cfg[key] = effective[key]
+        remote_url = str(engine_cfg.get("gpt_sovits_remote_url") or "").strip().rstrip("/")
+        transport = (remote_url, engine_cfg.get("gpt_sovits_remote_timeout_sec", 15)) if remote_url else ()
+        if name in self._engines:
+            if self._engine_transports.get(name, ()) == transport:
+                return self._engines[name]
+            LOGGER.debug("voice-tts: replacing engine=%s after remote transport settings changed", name)
+            self._engines.pop(name).close()
         engine = create_engine(name, engine_cfg)
         self._engines[name] = engine
+        self._engine_transports[name] = transport
         return engine
 
     def _save_wav(self, audio: np.ndarray, sample_rate: int, job_id: str) -> Path:
@@ -826,8 +837,9 @@ class _TTSWorker:
 
         cfg = self._load_config()
         engine_name = profile.get("engine") or cfg.get("default_engine", "gpt_sovits")
+        effective = _get_effective_params(job.persona_id)
         try:
-            engine = self._get_engine(engine_name)
+            engine = self._get_engine(engine_name, effective)
         except Exception as exc:
             LOGGER.error("Failed to initialize engine '%s': %s", engine_name, exc)
             notify_no_audio(
@@ -837,7 +849,9 @@ class _TTSWorker:
             )
             return
 
-        effective = _get_effective_params(job.persona_id)
+        synthesis_params = dict(profile.get("params") or {})
+        if job.persona_id:
+            synthesis_params["persona_id"] = job.persona_id
         LOGGER.debug(
             "effective addon params for persona=%s: streaming=%s server_side=%s enabled=%s",
             job.persona_id,
@@ -875,7 +889,7 @@ class _TTSWorker:
                 text=tts_text,
                 ref_audio=profile.get("ref_audio"),
                 ref_text=profile.get("ref_text"),
-                params=profile.get("params"),
+                params=synthesis_params,
                 job_id=job.job_id,
                 message_id=job.message_id,
                 server_side_playback=server_side_playback,
@@ -893,7 +907,7 @@ class _TTSWorker:
                 text=tts_text,
                 ref_audio=profile.get("ref_audio"),
                 ref_text=profile.get("ref_text"),
-                params=profile.get("params"),
+                params=synthesis_params,
             )
         except Exception as exc:
             LOGGER.error("TTS synthesis failed (engine=%s): %s", engine_name, exc)
