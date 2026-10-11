@@ -107,9 +107,12 @@ def _try_addon_persona_config(persona_id: Optional[str]) -> Optional[Dict[str, A
         # ローカルエンジンは ref_audio がないとプロファイル成立とみなさない
         # (registry.json フォールバックに移行させる)。API エンジンは
         # ref_audio が無くてもプロファイル成立とする。
-        remote_gpt_sovits = engine == "gpt_sovits" and str(
-            params.get("gpt_sovits_remote_url") or ""
-        ).strip()
+        # 外部 GPT-SoVITS は全体共通 URL か、ペルソナ別の上書き URL のどちらか
+        # があれば成立する (playback_worker._get_engine と同じ判定)。
+        remote_gpt_sovits = engine == "gpt_sovits" and bool(
+            str(params.get("gpt_sovits_remote_url_override") or "").strip()
+            or str(params.get("gpt_sovits_remote_url") or "").strip()
+        )
         if engine not in _API_ENGINES and not remote_gpt_sovits and not ref_audio:
             return None
         ref_text = params.get("ref_text", "")
@@ -124,9 +127,15 @@ def _try_addon_persona_config(persona_id: Optional[str]) -> Optional[Dict[str, A
             "auto_speak", "server_side_playback", "client_side_playback",
             "streaming", "output_device", "pronunciation_dict",
             "openai_api_key", "elevenlabs_api_key",
+            "gpt_sovits_remote_url", "gpt_sovits_remote_url_override",
+            "gpt_sovits_remote_timeout_sec",
         }
         return {
             "engine": engine,
+            # 参照音声なしで成立した外部 GPT-SoVITS プロファイル (サーバーに
+            # 登録済みの声を使う)。get_profile が registry.json のペルソナ別
+            # エントリより後ろ、_default より前に回す。
+            "_server_profile_only": bool(remote_gpt_sovits and not ref_audio),
             "ref_audio": str(ref_audio) if ref_audio else None,
             "ref_text": ref_text,
             "params": {k: v for k, v in params.items() if k not in _EXCLUDED_KEYS},
@@ -142,15 +151,25 @@ def get_profile(persona_id: Optional[str]) -> Optional[Dict[str, Any]]:
     Fallback order:
         1. AddonPersonaConfig (UI-managed ref_audio/ref_text)
         2. registry.json[persona_id]
+        2b. AddonPersonaConfig with a remote GPT-SoVITS URL but no ref_audio
+            (the server's already-registered profile for this persona)
         3. registry.json["_default"]
         4. None (TTS skipped)
+
+    2b sits before ``_default`` so the sample voice is never uploaded to a
+    shared server under this persona's ID (the remote engine updates server
+    profiles to match the local reference).
     """
     # Tier 1: AddonPersonaConfig
     addon_profile = _try_addon_persona_config(persona_id)
+    server_only: Optional[Dict[str, Any]] = None
     if addon_profile is not None:
-        addon_profile["ref_audio"] = _resolve_ref_audio(addon_profile.get("ref_audio"))
-        LOGGER.debug("profile source=addon_config persona=%s", persona_id)
-        return addon_profile
+        if addon_profile.pop("_server_profile_only", False):
+            server_only = addon_profile
+        else:
+            addon_profile["ref_audio"] = _resolve_ref_audio(addon_profile.get("ref_audio"))
+            LOGGER.debug("profile source=addon_config persona=%s", persona_id)
+            return addon_profile
 
     # Tier 2 / 3: registry.json
     registry = _load_registry()
@@ -158,6 +177,9 @@ def get_profile(persona_id: Optional[str]) -> Optional[Dict[str, Any]]:
     if persona_id and persona_id in registry:
         entry = dict(registry[persona_id])
         LOGGER.debug("profile source=registry persona=%s", persona_id)
+    elif server_only is not None:
+        LOGGER.debug("profile source=remote_server_profile persona=%s", persona_id)
+        return server_only
     elif "_default" in registry:
         entry = dict(registry["_default"])
         LOGGER.debug("profile source=registry_default persona=%s", persona_id)

@@ -180,7 +180,7 @@
         {
             "key": "ref_audio",
             "label": "参照音声",
-            "description": "ペルソナの声を再現するための参照音声 (3〜10 秒)。エンジンが gpt_sovits / irodori のときのみ使用される。両エンジンで同じ wav を使い回し可能。ローカル合成では必須。外部 GPT-SoVITS では未登録時に書き起こしと一緒に自動送信し、サーバーに登録済みなら省略可能。",
+            "description": "ペルソナの声を再現するための参照音声 (3〜10 秒)。エンジンが gpt_sovits / irodori のときのみ使用される。両エンジンで同じ wav を使い回し可能。ローカル合成では必須。外部 GPT-SoVITS では、サーバーに無いときや変更したときに書き起こしと一緒に自動送信する。サーバーに登録済みなら省略可能。",
             "type": "file",
             "accept": "audio/wav,audio/mpeg,audio/flac,audio/ogg",
             "max_size_mb": 50,
@@ -257,7 +257,7 @@
         {
             "key": "gpt_sovits_remote_url",
             "label": "GPT-SoVITS 外部サーバー URL (全体共通)",
-            "description": "外部の GPT-SoVITS HTTP サーバー URL (例: http://nebula.taildcdc91.ts.net:8082)。全ペルソナ共通で使用します。空欄時はローカルプロセスで合成します。ペルソナ別設定で個別上書きも可能です。",
+            "description": "外部の GPT-SoVITS HTTP サーバー URL (例: http://192.168.1.20:8082)。全ペルソナ共通で使用します。空欄時はローカルプロセスで合成します。ペルソナ別設定で個別上書きも可能です。",
             "type": "text",
             "default": "",
             "persona_configurable": false

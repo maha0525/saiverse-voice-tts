@@ -77,7 +77,8 @@ voice_profiles/
 外部サーバー URL はアドオン管理 UI、または `config/default.json` の
 `engines.gpt_sovits.gpt_sovits_remote_url` に設定します。
 通信タイムアウトは同階層の `gpt_sovits_remote_timeout_sec` (既定 15 秒) です。
-UI 設定が存在する場合は UI が優先されます。外部サーバーに送る合成引数は
+UI に URL を入力した場合は UI が優先されます (UI が空欄なら設定ファイルの URL を使います)。
+設定ファイルの URL だけで外部サーバーを使う場合、参照音声 (`ref_audio`) は省略できません。外部サーバーに送る合成引数は
 ペルソナ ID とテキストのみで、下表のローカル推論パラメータは送信しません。
 
 | キー | 既定値 | 説明 |

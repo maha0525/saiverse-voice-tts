@@ -64,12 +64,17 @@ setup.bat
 
 ## 外部 GPT-SoVITS サーバーを使う
 
-Skyrim 連携と同じ HTTP API (`/health`、`/profiles/{profile_id}`、`/synthesize`) を提供するサーバーに接続できます。GPT-SoVITS 本体の標準 API とは別の契約です。
+次の HTTP API (`/health`、`/profiles/{profile_id}`、`/synthesize`) を提供するサーバーに接続できます。GPT-SoVITS 本体の標準 API とは別の契約です。
+
+- `GET /health` → `{"ok": true}`
+- `GET /profiles/{profile_id}` → `{"exists": true, "ref_text": "..."}` または 404
+- `PUT /profiles/{profile_id}` (multipart: `ref_audio` ファイル + `ref_text`) → `{"ok": true}`
+- `POST /synthesize` (JSON: `profile_id`, `text`) → 完成した WAV
 
 1. 更新したアドオンを読み込むため SAIVerse のバックエンドを再起動します。
 2. **アドオン管理 → Voice TTS** で「TTS エンジン」を `gpt_sovits` にします。
-3. 「GPT-SoVITS 外部サーバー URL」にサーバーの URL (例: `http://nebula.taildcdc91.ts.net:8082`) を入力します。全体設定とペルソナ別設定が使えます。
-4. 各ペルソナの参照音声と書き起こしを設定します。合成時に、そのペルソナ ID のプロファイルがサーバーに無ければ自動で送信・登録します。登録済みなら上書きせず利用します。登録済みの ID に対してはローカルの参照音声を省略できます。
+3. 「GPT-SoVITS 外部サーバー URL」にサーバーの URL (例: `http://192.168.1.20:8082`) を入力します。全体設定と、ペルソナ別の上書き URL が使えます。
+4. 各ペルソナの参照音声と書き起こしを設定します。プロファイル ID はペルソナ ID です。合成時に、サーバーにそのプロファイルが無いとき、またはサーバー側の書き起こしや手元の参照音声が変わっていたときは、手元の参照音声と書き起こしを送って登録し直します (手元の設定が正です)。サーバーに登録済みのペルソナは、参照音声を設定しなくても使えます。
 5. 必要ならタイムアウトを変更します (既定 15 秒、1〜120 秒)。プロファイル確認・登録・合成の各 HTTP 要求に適用します。
 
 外部サーバーを使うクライアント側では GPT-SoVITS の専用 Python 環境やモデルは不要です。URL・タイムアウトの設定変更は次の合成で反映されます。URL を空欄に戻すと、導入済みのローカルエンジンに切り替わります。外部サーバーとの通信失敗時はログと既存の音声失敗通知を出します。

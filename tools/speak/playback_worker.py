@@ -421,8 +421,12 @@ class _TTSWorker:
         self._queue: "queue.Queue[Optional[_Job]]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        self._engines: Dict[str, TTSEngine] = {}
-        self._engine_transports: Dict[str, tuple] = {}
+        # (engine name, remote transport) -> engine. transport is () for the
+        # local engine and (url, timeout) for a remote GPT-SoVITS server.
+        self._engines: Dict[tuple, TTSEngine] = {}
+        # (engine name, remote url) -> current cache key, to close the old
+        # engine when only that server's timeout setting changes.
+        self._remote_engine_keys: Dict[tuple, tuple] = {}
         # Pipeline Streaming で同 message_id の sub-text 群が共有する状態。
         # _process は 1 worker thread から逐次 access するので競合しないが、
         # 「is_final=True の job が完了した時に state を drop」 を確実にする
@@ -467,22 +471,34 @@ class _TTSWorker:
         cfg = self._load_config()
         engine_cfg = dict((cfg.get("engines") or {}).get(name, {}))
         if name == "gpt_sovits":
-            for key in ("gpt_sovits_remote_url", "gpt_sovits_remote_timeout_sec"):
-                if effective is not None and key in effective:
-                    engine_cfg[key] = effective[key]
+            # UI の値を優先する。ただし UI の URL が空 (addon.json の既定) なら
+            # config/default.json の engines.gpt_sovits の URL を残す。
+            ui_url = str((effective or {}).get("gpt_sovits_remote_url") or "").strip()
+            if ui_url:
+                engine_cfg["gpt_sovits_remote_url"] = ui_url
+            if effective is not None and "gpt_sovits_remote_timeout_sec" in effective:
+                engine_cfg["gpt_sovits_remote_timeout_sec"] = effective["gpt_sovits_remote_timeout_sec"]
             override_url = str((effective or {}).get("gpt_sovits_remote_url_override") or "").strip()
             if override_url:
                 engine_cfg["gpt_sovits_remote_url"] = override_url
         remote_url = str(engine_cfg.get("gpt_sovits_remote_url") or "").strip().rstrip("/")
         transport = (remote_url, engine_cfg.get("gpt_sovits_remote_timeout_sec", 15)) if remote_url else ()
-        if name in self._engines:
-            if self._engine_transports.get(name, ()) == transport:
-                return self._engines[name]
-            LOGGER.debug("voice-tts: replacing engine=%s after remote transport settings changed", name)
-            self._engines.pop(name).close()
+        # Engines are cached per (engine, transport) so personas on the local
+        # engine and personas on a remote server (or on different servers) can
+        # alternate without killing the local child process and reloading the
+        # model on every switch. Only a remote engine whose settings changed is
+        # replaced.
+        key = (name, transport)
+        if key in self._engines:
+            return self._engines[key]
+        stale = self._remote_engine_keys.get((name, remote_url)) if remote_url else None
+        if stale is not None and stale in self._engines:
+            LOGGER.debug("voice-tts: replacing engine=%s after remote timeout changed", name)
+            self._engines.pop(stale).close()
         engine = create_engine(name, engine_cfg)
-        self._engines[name] = engine
-        self._engine_transports[name] = transport
+        self._engines[key] = engine
+        if remote_url:
+            self._remote_engine_keys[(name, remote_url)] = key
         return engine
 
     def _save_wav(self, audio: np.ndarray, sample_rate: int, job_id: str) -> Path:
