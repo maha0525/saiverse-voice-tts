@@ -470,6 +470,9 @@ class _TTSWorker:
             for key in ("gpt_sovits_remote_url", "gpt_sovits_remote_timeout_sec"):
                 if effective is not None and key in effective:
                     engine_cfg[key] = effective[key]
+            override_url = str((effective or {}).get("gpt_sovits_remote_url_override") or "").strip()
+            if override_url:
+                engine_cfg["gpt_sovits_remote_url"] = override_url
         remote_url = str(engine_cfg.get("gpt_sovits_remote_url") or "").strip().rstrip("/")
         transport = (remote_url, engine_cfg.get("gpt_sovits_remote_timeout_sec", 15)) if remote_url else ()
         if name in self._engines:

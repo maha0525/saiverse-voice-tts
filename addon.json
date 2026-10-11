@@ -153,22 +153,12 @@
             "persona_configurable": true
         },
         {
-            "key": "gpt_sovits_remote_url",
-            "label": "GPT-SoVITS 外部サーバー URL",
-            "description": "外部の GPT-SoVITS HTTP サーバー URL (例: http://nebula.taildcdc91.ts.net:8082)。空欄時はローカルプロセスで合成します。",
+            "key": "gpt_sovits_remote_url_override",
+            "label": "GPT-SoVITS 外部サーバー URL (個別上書き)",
+            "description": "このペルソナのみ別の外部サーバーを指定したい場合に入力。空欄なら全体共通のサーバーURLを使用します。",
             "type": "text",
             "default": "",
             "persona_configurable": true
-        },
-        {
-            "key": "gpt_sovits_remote_timeout_sec",
-            "label": "GPT-SoVITS 外部サーバーのタイムアウト (秒)",
-            "description": "外部サーバーとの通信タイムアウト秒数。",
-            "type": "number",
-            "default": 15,
-            "min": 1,
-            "max": 120,
-            "advanced": true
         },
         {
             "key": "openai_voice",
@@ -263,6 +253,25 @@
             "persona_configurable": false,
             "collapsible": true,
             "default_collapsed": true
+        },
+        {
+            "key": "gpt_sovits_remote_url",
+            "label": "GPT-SoVITS 外部サーバー URL (全体共通)",
+            "description": "外部の GPT-SoVITS HTTP サーバー URL (例: http://nebula.taildcdc91.ts.net:8082)。全ペルソナ共通で使用します。空欄時はローカルプロセスで合成します。ペルソナ別設定で個別上書きも可能です。",
+            "type": "text",
+            "default": "",
+            "persona_configurable": false
+        },
+        {
+            "key": "gpt_sovits_remote_timeout_sec",
+            "label": "GPT-SoVITS 外部サーバーのタイムアウト (秒)",
+            "description": "外部サーバーとの通信タイムアウト秒数。",
+            "type": "number",
+            "default": 15,
+            "min": 1,
+            "max": 120,
+            "advanced": true,
+            "persona_configurable": false
         }
     ],
     "server_hooks": [

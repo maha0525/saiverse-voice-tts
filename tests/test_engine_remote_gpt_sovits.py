@@ -289,6 +289,11 @@ class RemoteWorkerTests(unittest.TestCase):
             third = worker._get_engine("gpt_sovits", settings)
             self.assertIsNot(third, second)
             self.assertEqual(third.timeout_sec, 11)
+            settings["gpt_sovits_remote_url_override"] = "http://override.invalid"
+            fourth = worker._get_engine("gpt_sovits", settings)
+            self.assertIsNot(fourth, third)
+            self.assertEqual(fourth.base_url, "http://override.invalid")
+            settings["gpt_sovits_remote_url_override"] = ""
             settings["gpt_sovits_remote_url"] = ""
             with patch.dict(os.environ, {"VOICE_TTS_IN_PROCESS": "0"}):
                 local = worker._get_engine("gpt_sovits", settings)
