@@ -22,7 +22,8 @@ Background worker thread (_TTSWorker._run)
    │
    ├─ profile = get_profile(persona_id)           registry.json または UI アップロードから
    ├─ engine = create_engine(profile.engine)      初回のみ lazy load
-   │     (gpt_sovits / irodori は子プロセスの代理エンジン。子プロセスは
+   │     (gpt_sovits の外部 URL 設定時は HTTP エンジン。それ以外の
+   │      gpt_sovits / irodori は子プロセスの代理エンジン。子プロセスは
    │      エンジン専用の Python 環境の Python で動く — docs/out_of_process.md)
    │
    ├─ [ストリーミング対応エンジン]
@@ -150,6 +151,29 @@ stream.stop(); stream.close()
 - `supports_streaming: bool`: クラスレベルフラグ
 - `SynthesisResult`: 一括合成の結果(audio, sample_rate, duration_ms)
 - `SynthesisChunk`: ストリーミング単位(audio, sample_rate)
+
+#### `remote_gpt_sovits.py`
+
+`gpt_sovits_remote_url` (またはペルソナ別の `gpt_sovits_remote_url_override`) が
+設定されている場合の HTTP エンジン。worker は UI の実効 URL / タイムアウトを
+エンジン設定へ渡し、エンジンを (エンジン名, URL, タイムアウト) ごとにキャッシュする。
+ローカル合成のペルソナと外部サーバーのペルソナが交互に話しても、ローカルの
+子プロセスは閉じない。ジョブの persona_id を合成引数へ渡す。
+
+- `GET /health` → `ok=true` (明示的な接続確認用)
+- 参照音声・書き起こしがある場合 `GET /profiles/{persona_id}` で存在と書き起こしを確認
+- 404 / exists=false / 書き起こしの不一致 / 手元の参照音声の変更があれば、
+  multipart `PUT /profiles/{persona_id}` で登録し直す (手元のペルソナ設定が正)。
+  確認済みの参照音声はエンジン内で覚えておき、文ごとの確認往復を省く
+- `POST /synthesize` に `profile_id` と `text` を送り WAV を受信
+  (失敗したら覚えた確認を捨て、次の文で確認し直す)
+- WAV を mono float32 にデコードし `SynthesisResult` を返す
+
+`supports_streaming=True` は完成 WAV を一チャンクで渡す基底アダプタの利用を表す。
+これにより worker の sub_seq / finalize による文ごとの連結・配信を維持する。
+サーバー内部の逐次推論ではない。通信や不正応答は RuntimeError とログで通知する。
+同じサーバーを使う他のクライアントと HTTP 契約を揃え、他のアドオンへの import 依存は作らない。
+設計と隔離検証は [remote_gpt_sovits.md](docs/intent/remote_gpt_sovits.md) を参照。
 
 #### `gpt_sovits.py`
 最も完成度の高いエンジン。`supports_streaming = True`。

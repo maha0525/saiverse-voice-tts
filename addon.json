@@ -146,10 +146,18 @@
         {
             "key": "engine",
             "label": "TTS エンジン",
-            "description": "ペルソナの音声合成エンジン。gpt_sovits / irodori はローカル合成 (参照音声を使う。Windows/Linux は NVIDIA GPU 推奨、Mac は MPS か CPU で動かすが動作未確認) で、アドオンの導入時に選んだエンジンだけが使える (選んでいないエンジンを指定すると音声は作られない。あとからアドオン管理の『選択肢を追加』で足せる)。openai_tts / elevenlabs はクラウド API で GPU 不要 (それぞれ OpenAI 音声 / ElevenLabs Voice ID を指定)。未選択時は gpt_sovits。",
+            "description": "ペルソナの音声合成エンジン。gpt_sovits は外部サーバー URL を設定すると HTTP 合成、空欄ならローカル合成。irodori はローカル合成。ローカルエンジンは導入時に選んだものだけが使える (あとからアドオン管理の『選択肢を追加』で足せる)。openai_tts / elevenlabs はクラウド API で GPU 不要 (それぞれ OpenAI 音声 / ElevenLabs Voice ID を指定)。未選択時は gpt_sovits。",
             "type": "dropdown",
             "default": "gpt_sovits",
             "options": ["gpt_sovits", "irodori", "openai_tts", "elevenlabs"],
+            "persona_configurable": true
+        },
+        {
+            "key": "gpt_sovits_remote_url_override",
+            "label": "GPT-SoVITS 外部サーバー URL (個別上書き)",
+            "description": "このペルソナのみ別の外部サーバーを指定したい場合に入力。空欄なら全体共通のサーバーURLを使用します。",
+            "type": "text",
+            "default": "",
             "persona_configurable": true
         },
         {
@@ -172,7 +180,7 @@
         {
             "key": "ref_audio",
             "label": "参照音声",
-            "description": "ペルソナの声を再現するための参照音声 (3〜10 秒、必須)。エンジンが gpt_sovits / irodori のときのみ使用される。両エンジンで同じ wav を使い回し可能。",
+            "description": "ペルソナの声を再現するための参照音声 (3〜10 秒)。エンジンが gpt_sovits / irodori のときのみ使用される。両エンジンで同じ wav を使い回し可能。ローカル合成では必須。外部 GPT-SoVITS では、サーバーに無いときや変更したときに書き起こしと一緒に自動送信する。サーバーに登録済みなら省略可能。",
             "type": "file",
             "accept": "audio/wav,audio/mpeg,audio/flac,audio/ogg",
             "max_size_mb": 50,
@@ -245,6 +253,25 @@
             "persona_configurable": false,
             "collapsible": true,
             "default_collapsed": true
+        },
+        {
+            "key": "gpt_sovits_remote_url",
+            "label": "GPT-SoVITS 外部サーバー URL (全体共通)",
+            "description": "外部の GPT-SoVITS HTTP サーバー URL (例: http://192.168.1.20:8082)。全ペルソナ共通で使用します。空欄時はローカルプロセスで合成します。ペルソナ別設定で個別上書きも可能です。",
+            "type": "text",
+            "default": "",
+            "persona_configurable": false
+        },
+        {
+            "key": "gpt_sovits_remote_timeout_sec",
+            "label": "GPT-SoVITS 外部サーバーのタイムアウト (秒)",
+            "description": "外部サーバーとの通信タイムアウト秒数。",
+            "type": "number",
+            "default": 15,
+            "min": 1,
+            "max": 120,
+            "advanced": true,
+            "persona_configurable": false
         }
     ],
     "server_hooks": [

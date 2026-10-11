@@ -4,6 +4,11 @@
 **作成日**: 2026-05-24
 **関連**: 発生源は SAIVerse 本体リポジトリの `docs/issues/mcp_cancel_scope_spin_gil_starvation.md`
 
+**外部サーバー対応の追記**: 以下はローカル合成の設計。
+`gpt_sovits_remote_url` 設定時は HTTP エンジンを使い、子プロセスを起動しない。
+URL が空の GPT-SoVITS と Irodori-TTS は従来どおり別プロセスで動く。
+外部サーバーの契約と検証は [remote_gpt_sovits.md](intent/remote_gpt_sovits.md) を参照。
+
 ## なぜやるか
 
 GPT-SoVITS の音声合成は SAIVerse 本体と同じ Python プロセスの中のスレッドで

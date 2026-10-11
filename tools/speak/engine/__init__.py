@@ -9,6 +9,11 @@ from .base import SynthesisResult, TTSEngine
 
 def create_engine(name: str, engine_config: Dict[str, Any]) -> TTSEngine:
     name = (name or "").lower()
+    if name == "gpt_sovits" and str(
+        (engine_config or {}).get("gpt_sovits_remote_url") or ""
+    ).strip():
+        from .remote_gpt_sovits import RemoteGPTSoVITSEngine
+        return RemoteGPTSoVITSEngine(engine_config)
     if name in ("gpt_sovits", "irodori"):
         # ローカル合成 (gpt_sovits / irodori) は常に別プロセスで動かす (代理
         # エンジン経由)。理由は二つ:
