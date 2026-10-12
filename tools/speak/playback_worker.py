@@ -601,6 +601,8 @@ class _TTSWorker:
             state.t_start = time.time()
         if state.initial_job_id is None:
             state.initial_job_id = job_id
+        # この文の声を一片でも流したかを見るため、始める前の断片数を覚える
+        collected_before = len(state.collected)
 
         try:
             for chunk in engine.synthesize_stream(
@@ -698,8 +700,19 @@ class _TTSWorker:
                 "Streaming synthesis/playback failed: %s (msg=%s, sub=%s)",
                 exc, message_id, sub_seq,
             )
-            self._teardown_message_state(state, message_id)
-            return False
+            if len(state.collected) == collected_before:
+                # まだ一片も流していない: 呼び出し側が一括合成で作り直す
+                self._teardown_message_state(state, message_id)
+                return False
+            # この文の前半はもう鳴っている。一文丸ごと作り直すと前半がもう一度
+            # 鳴るので作り直さず、流した分で文を終えて、吹き出しの続き (次の文・
+            # 完成 WAV の保存) は普段どおり進める。外部サーバーとの接続が途中で
+            # 切れたときに起きやすい。
+            LOGGER.warning(
+                "Keeping the partial audio already played instead of re-synthesizing "
+                "the whole sentence (msg=%s, sub=%s)",
+                message_id, sub_seq,
+            )
 
         # is_final=False (= 中間 sub-text) の場合は ここで return。 stream は
         # 開いたまま、 collected は累積したまま、 次の sub-text の

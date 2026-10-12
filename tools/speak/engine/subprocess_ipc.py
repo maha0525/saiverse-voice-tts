@@ -25,6 +25,14 @@ import numpy as np
 _LEN = struct.Struct(">I")
 
 
+def frame_bytes(payload: bytes) -> bytes:
+    """ペイロードの先頭に長さを付けた、1 フレーム分のバイト列。
+
+    音声合成サーバー (tools/speak/server.py) は、これを HTTP の応答本文に流す。
+    """
+    return _LEN.pack(len(payload)) + payload
+
+
 def write_frame(stream, payload: bytes) -> None:
     """長さ付きフレームを書いて flush する。
 
@@ -32,7 +40,7 @@ def write_frame(stream, payload: bytes) -> None:
     返ることがある (io.RawIOBase.write の仕様)。書き切るまで繰り返す —
     途中で切れたフレームは、読み手が長さを読み違えて永遠に待つ事故になる。
     """
-    view = memoryview(_LEN.pack(len(payload)) + payload)
+    view = memoryview(frame_bytes(payload))
     while view:
         written = stream.write(view)
         if written is None:  # buffered な stream は全部書いて None を返す

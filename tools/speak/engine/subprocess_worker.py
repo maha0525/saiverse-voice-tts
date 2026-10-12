@@ -3,7 +3,8 @@
 本体プロセス (SAIVerse) とは独立した素の Python プロセスとして起動され、
 ``--engine`` で指定されたローカル合成エンジン (``GPTSoVITSEngine`` /
 ``IrodoriEngine``) の本物を保持する。標準入力でリクエストを受け、標準出力に
-音声フレームを流す (プロトコルは subprocess_ipc を参照)。
+音声フレームを流す (プロトコルは subprocess_ipc を参照)。エンジンを回す部分は
+音声合成サーバー (tools/speak/server.py) と共通の synthesis_core にある。
 
 アドオンカタログで導入した場合は、そのエンジン専用の Python 環境の Python で
 起動される (起動する側: subprocess_proxy.resolve_worker_python)。
@@ -57,22 +58,14 @@ def main() -> int:
 
     from engine.subprocess_ipc import (
         decode_request,
-        encode_chunk,
         encode_end,
         encode_error,
-        encode_result,
         read_frame,
         write_frame,
     )
+    from engine.synthesis_core import create_local_engine, iter_response_frames
 
-    if args.engine == "irodori":
-        from engine.irodori import IrodoriEngine
-
-        engine = IrodoriEngine(config)
-    else:
-        from engine.gpt_sovits import GPTSoVITSEngine
-
-        engine = GPTSoVITSEngine(config)
+    engine = create_local_engine(args.engine, config)
     print(
         f"voice-tts worker: started (engine={args.engine}, python={sys.executable})",
         file=sys.stderr, flush=True,
@@ -83,24 +76,14 @@ def main() -> int:
         if payload is None:
             break  # 親プロセスが stdin を閉じた = 終了
 
+        # エンジンの失敗は共通の合成関数がエラーと終了のフレームにして返す。
+        # ここに来る例外は、依頼の読み取りの失敗と、出力路への書き出しの失敗。
+        frames = None
         try:
             req = decode_request(payload)
-            method = req.get("method", "stream")
-            text = req.get("text", "")
-            ref_audio = req.get("ref_audio")
-            ref_text = req.get("ref_text")
-            params = req.get("params") or {}
-
-            if method == "synthesize":
-                result = engine.synthesize(text, ref_audio, ref_text, params)
-                write_frame(
-                    proto_out,
-                    encode_result(result.audio, result.sample_rate, result.duration_ms),
-                )
-            else:
-                for chunk in engine.synthesize_stream(text, ref_audio, ref_text, params):
-                    write_frame(proto_out, encode_chunk(chunk.audio, chunk.sample_rate))
-            write_frame(proto_out, encode_end())
+            frames = iter_response_frames(engine, req)
+            for frame in frames:
+                write_frame(proto_out, frame)
         except Exception as exc:  # 1 リクエストの失敗でプロセスは落とさない
             import traceback
 
@@ -110,6 +93,9 @@ def main() -> int:
                 write_frame(proto_out, encode_end())
             except Exception:
                 break  # 出力路が壊れていたら諦めて終了
+        finally:
+            if frames is not None:
+                frames.close()
 
     return 0
 

@@ -160,20 +160,36 @@ stream.stop(); stream.close()
 ローカル合成のペルソナと外部サーバーのペルソナが交互に話しても、ローカルの
 子プロセスは閉じない。ジョブの persona_id を合成引数へ渡す。
 
-- `GET /health` → `ok=true` (明示的な接続確認用)
+- 最初の合成の前に `GET /health` で `protocol` を確かめる (合成が失敗したら忘れて確かめ直す)
 - 参照音声・書き起こしがある場合 `GET /profiles/{persona_id}` で存在と書き起こしを確認
 - 404 / exists=false / 書き起こしの不一致 / 手元の参照音声の変更があれば、
   multipart `PUT /profiles/{persona_id}` で登録し直す (手元のペルソナ設定が正)。
   確認済みの参照音声はエンジン内で覚えておき、文ごとの確認往復を省く
-- `POST /synthesize` に `profile_id` と `text` を送り WAV を受信
-  (失敗したら覚えた確認を捨て、次の文で確認し直す)
-- WAV を mono float32 にデコードし `SynthesisResult` を返す
+- `protocol` >= 2 のサーバー: `POST /synthesize` に `profile_id`・`text`・`params`
+  (ペルソナの調整値)・`"stream": true` を送り、子プロセスと同じ長さ付きフレームで
+  声の断片を受け取る。応答は別スレッドで読み続けてキューに溜めるので、再生側の
+  流量制御の待ちでサーバーの順番を占めない。終了のフレームまで来て初めて成功
+- `protocol` の無い古いサーバー: `profile_id` と `text` だけを送り、完成した WAV を
+  mono float32 にデコードして一つの断片として返す (調整値は効かない、とログに一度残す)
 
-`supports_streaming=True` は完成 WAV を一チャンクで渡す基底アダプタの利用を表す。
-これにより worker の sub_seq / finalize による文ごとの連結・配信を維持する。
-サーバー内部の逐次推論ではない。通信や不正応答は RuntimeError とログで通知する。
-同じサーバーを使う他のクライアントと HTTP 契約を揃え、他のアドオンへの import 依存は作らない。
-設計と隔離検証は [remote_gpt_sovits.md](docs/intent/remote_gpt_sovits.md) を参照。
+通信や不正応答は RuntimeError とログで通知する。同じサーバーを使う他のクライアントと
+HTTP のやり取りを揃え、他のアドオンへの import 依存は作らない。
+設計は [synthesis_server.md](docs/intent/synthesis_server.md)、プロファイルの登録規則は
+[remote_gpt_sovits.md](docs/intent/remote_gpt_sovits.md) を参照。
+
+#### `synthesis_core.py` と音声合成サーバー (`tools/speak/server.py`)
+
+`synthesis_core.iter_response_frames` が、合成の依頼を一つ受けてエンジンを回し、
+送るべきフレームを順に返す共通の合成関数。子プロセス (`subprocess_worker.py`、
+標準出力へ書く) と音声合成サーバー (`server.py`、HTTP の応答本文へ書く) の両方が
+これを呼ぶので、ローカルと外部で同じエンジンのコードが同じ調整値で声を作る。
+
+`server.py` は標準ライブラリの HTTP サーバーで、エンジン専用の Python 環境の中で
+動く (SAIVerse を import しない)。合成とプロファイルの登録は一つの鍵で一件ずつ処理し、
+依頼元が切断したら次のフレームを書けなかった時点で合成を打ち切る。起動は
+`serve.bat` / `serve.sh` → `serve_launcher.py` で、SAIVerse の Python から
+`resolve_worker_python(strict=True)` でエンジンの環境を探し、無ければ理由を出して止まる
+(`--python` 指定時は SAIVerse を探さない)。
 
 #### `gpt_sovits.py`
 最も完成度の高いエンジン。`supports_streaming = True`。

@@ -7,7 +7,10 @@
 **外部サーバー対応の追記**: 以下はローカル合成の設計。
 `gpt_sovits_remote_url` 設定時は HTTP エンジンを使い、子プロセスを起動しない。
 URL が空の GPT-SoVITS と Irodori-TTS は従来どおり別プロセスで動く。
-外部サーバーの契約と検証は [remote_gpt_sovits.md](intent/remote_gpt_sovits.md) を参照。
+子プロセスの「依頼を受けて、エンジンを回して、フレームを返す」部分は
+`engine/synthesis_core.py` の共通の合成関数に切り出し、別の PC で動く音声合成サーバー
+(`tools/speak/server.py`) と共有している。子プロセスとのつなぎ方 (標準入出力) は
+変えていない。外部サーバーの設計は [synthesis_server.md](intent/synthesis_server.md) を参照。
 
 ## なぜやるか
 

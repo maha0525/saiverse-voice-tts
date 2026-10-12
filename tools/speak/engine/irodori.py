@@ -249,6 +249,8 @@ class IrodoriEngine(TTSEngine):
     def __init__(self, engine_config: Dict[str, Any]):
         super().__init__(engine_config)
         self._runtime = None
+        # 読み込み後に実際に使っている device (音声合成サーバーの /health が報告する)
+        self.device: Optional[str] = None
 
     def _lazy_load(self) -> None:
         if self._runtime is not None:
@@ -298,6 +300,7 @@ class IrodoriEngine(TTSEngine):
                 codec_repo=codec_repo,
             )
         )
+        self.device = device
 
     @staticmethod
     def _resolve_checkpoint(checkpoint: str) -> str:

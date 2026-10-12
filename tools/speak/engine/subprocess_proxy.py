@@ -19,6 +19,9 @@ GPT-SoVITS と Irodori-TTS のパッケージは本体の venv とも互いと�
 3. 専用環境がある → その Python。本体の Python と版がずれていたら
    (``AddonEnvError``)、黙って本体の Python に落とさず ``WorkerEnvError`` で止める
 
+音声合成サーバーの起動役 (serve_launcher) は ``strict=True`` で呼び、1 と 2 でも
+``WorkerEnvError`` で止まる。
+
 設計判断は docs/out_of_process.md を参照:
 - 通信 = 標準入出力 (長さ付きフレーム)
 - 適用 = ローカルの gpt_sovits / irodori (外部 GPT-SoVITS URL 設定時は HTTP)
@@ -73,10 +76,17 @@ class WorkerEnvError(RuntimeError):
     """
 
 
-def resolve_worker_python(env_name: str) -> Tuple[str, Optional[Dict[str, str]]]:
+def resolve_worker_python(
+    env_name: str, *, strict: bool = False,
+) -> Tuple[str, Optional[Dict[str, str]]]:
     """子プロセスを起動する Python と、子プロセスに渡す環境変数を返す。
 
     返値の環境変数が None のときは、親の環境をそのまま引き継ぐ (旧来どおり)。
+
+    ``strict=True`` (音声合成サーバーの起動役 serve_launcher が使う) では、
+    SAIVerse を import できないときと専用環境が無いときに、いまの Python へ戻らず
+    ``WorkerEnvError`` で止まる。サーバーは子プロセスと違い、エンジンの入って
+    いない Python で起動すると、最初の合成まで失敗が見えないため。
     """
     try:
         from saiverse.addon_paths import (  # type: ignore
@@ -84,12 +94,25 @@ def resolve_worker_python(env_name: str) -> Tuple[str, Optional[Dict[str, str]]]
             get_addon_env_dir,
             get_addon_env_python,
         )
-    except ImportError:
+    except ImportError as exc:
+        if strict:
+            raise WorkerEnvError(
+                "SAIVerse の saiverse.addon_paths を import できないので、音声エンジンの"
+                "専用の Python 環境を探せません。SAIVerse に入れた Voice TTS のフォルダ"
+                "から起動するか、--python でエンジンの入った Python を指定してください。"
+                f"(詳細: {exc})"
+            ) from exc
         # SAIVerse 本体の外 (スタンドアロン実行・テスト) — 旧来どおり
         return sys.executable, None
 
     env_dir = get_addon_env_dir(_ADDON_ID, env_name)
     if not env_dir.exists():
+        if strict:
+            raise WorkerEnvError(
+                f"音声エンジンの専用の Python 環境 ({env_name}) が見つかりません ({env_dir})。"
+                "アドオン管理でこのエンジンを選んで voice-tts を入れ直すか、--python で"
+                "エンジンの入った Python を指定してください。"
+            )
         # 専用環境が無い = 旧来の手動導入 (setup.bat が本体 venv に全部入れた形)
         return sys.executable, None
 
@@ -103,6 +126,7 @@ def resolve_worker_python(env_name: str) -> Tuple[str, Optional[Dict[str, str]]]
         ) from exc
 
     env = os.environ.copy()
+    # CUDA_VISIBLE_DEVICES など、呼び出し側が立てた変数はそのまま引き継ぐ。
     # 本体側で PYTHONHOME が立っていると、venv の Python が本体の標準ライブラリを
     # 探しに行って起動に失敗するので外す。PYTHONPATH も外す — 本体のルートが
     # 入っていると本体の tools/ が子プロセスに持ち込まれ、GPT-SoVITS 内部の
