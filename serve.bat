@@ -25,15 +25,26 @@ for %%I in ("%PACK_ROOT%\..\..") do set "SAIVERSE_ROOT=%%~fI"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
+REM The Python given with --python (if any) can also run the launcher, which
+REM needs only the standard library in --python mode. (shift does not change %*)
+set "ARG_PY="
+:scan
+if "%~1"=="" goto scanned
+if /i "%~1"=="--python" set "ARG_PY=%~2"
+shift
+goto scan
+:scanned
+
 set "LAUNCHER_PY=%SAIVERSE_ROOT%\.venv\Scripts\python.exe"
 if exist "%LAUNCHER_PY%" goto run
 
 echo [voice-tts] SAIVerse's Python was not found at "%LAUNCHER_PY%". 1>&2
-echo [voice-tts] Running the launcher with python on PATH; without SAIVerse only --python mode works. 1>&2
+echo [voice-tts] Without SAIVerse only --python mode works. 1>&2
 set "LAUNCHER_PY="
-for /f "delims=" %%P in ('where python 2^>nul') do if not defined LAUNCHER_PY set "LAUNCHER_PY=%%P"
+if defined ARG_PY set "LAUNCHER_PY=%ARG_PY%"
+if not defined LAUNCHER_PY for /f "delims=" %%P in ('where python 2^>nul') do if not defined LAUNCHER_PY set "LAUNCHER_PY=%%P"
 if not defined LAUNCHER_PY (
-    echo [voice-tts] No python found on PATH. 1>&2
+    echo [voice-tts] No python found ^(give one with --python^). 1>&2
     exit /b 2
 )
 

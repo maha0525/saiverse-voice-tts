@@ -25,13 +25,29 @@ SAIVERSE_ROOT="$(cd "$PACK_ROOT/../.." && pwd)"
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
+# The Python given with --python (if any): it can also run the launcher, which
+# needs only the standard library in --python mode.
+ARG_PY=""
+prev=""
+for arg in "$@"; do
+    case "$arg" in
+        --python=*) ARG_PY="${arg#--python=}" ;;
+        *) [ "$prev" = "--python" ] && ARG_PY="$arg" ;;
+    esac
+    prev="$arg"
+done
+
 LAUNCHER_PY="$SAIVERSE_ROOT/.venv/bin/python"
 if [ ! -x "$LAUNCHER_PY" ]; then
     echo "[voice-tts] SAIVerse's Python was not found at $LAUNCHER_PY." >&2
-    echo "[voice-tts] Running the launcher with python on PATH; without SAIVerse only --python mode works." >&2
-    LAUNCHER_PY="$(command -v python3 || command -v python || true)"
+    echo "[voice-tts] Without SAIVerse only --python mode works." >&2
+    if [ -n "$ARG_PY" ]; then
+        LAUNCHER_PY="$ARG_PY"
+    else
+        LAUNCHER_PY="$(command -v python3 || command -v python || true)"
+    fi
     if [ -z "$LAUNCHER_PY" ]; then
-        echo "[voice-tts] No python found on PATH." >&2
+        echo "[voice-tts] No python found (give one with --python)." >&2
         exit 2
     fi
 fi
