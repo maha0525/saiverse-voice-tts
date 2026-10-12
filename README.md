@@ -64,22 +64,52 @@ setup.bat
 
 ## 外部 GPT-SoVITS サーバーを使う
 
-次の HTTP API (`/health`、`/profiles/{profile_id}`、`/synthesize`) を提供するサーバーに接続できます。GPT-SoVITS 本体の標準 API とは別の契約です。
+GPU のある別の PC で声を作り、この PC へ届けることができます。外部サーバーでも、ローカル合成と同じエンジンのコードが同じ調整値 (話速など) で声を作り、声ができた分から順に再生が始まります。設計は [docs/intent/synthesis_server.md](docs/intent/synthesis_server.md) にあります。
 
-- `GET /health` → `{"ok": true}`
-- `GET /profiles/{profile_id}` → `{"exists": true, "ref_text": "..."}` または 404
-- `PUT /profiles/{profile_id}` (multipart: `ref_audio` ファイル + `ref_text`) → `{"ok": true}`
-- `POST /synthesize` (JSON: `profile_id`, `text`) → 完成した WAV
+### サーバーを立てる (GPU のある PC)
+
+1. その PC の SAIVerse に、Voice TTS をアドオンカタログから入れます。導入時の質問で GPT-SoVITS を選んでください (SAIVerse 本体を起動しておく必要はありません)。
+2. Voice TTS のフォルダ (`expansion_data/saiverse-voice-tts`) で起動スクリプトを実行します。別の PC から使うので `--host 0.0.0.0` を付けます。
+
+   ```bat
+   serve.bat --host 0.0.0.0
+   ```
+
+   Linux / macOS は `./serve.sh --host 0.0.0.0` です。待ち受けのポートは既定で 8082 (`--port` で変更)。起動するとモデルの読み込みが始まり、終わるまでの合成の依頼には「読み込み中」を返します。
+
+- GPU が複数ある PC では、起動の前に `CUDA_VISIBLE_DEVICES` で使う GPU を選んでください (例: `set CUDA_VISIBLE_DEVICES=1`)。
+- 登録された声 (プロファイル) は `~/.saiverse/user_data/addon_data/saiverse-voice-tts/server/` に保存されます。置き場所は `--data-dir` で変えられます。
+- SAIVerse を入れていない PC や、`setup.bat` で SAIVerse 本体の環境に直接入れた古い導入では、GPT-SoVITS の入った Python を `--python` で指定します (このときは `--data-dir` も必須です)。
+
+  ```bat
+  serve.bat --python C:\path\to\python.exe --data-dir C:\path\to\voice-server --host 0.0.0.0
+  ```
+
+- 言語などのエンジンの設定は、サーバーの PC の `config/default.json` (`engines.gpt_sovits`) に従います。手元の PC と言語の設定がずれていると、声もずれます。
+- **認証はありません。** LAN や Tailscale の中だけで使い、インターネットには公開しないでください。
+
+### サーバーを使う (声を聞く PC)
 
 1. 更新したアドオンを読み込むため SAIVerse のバックエンドを再起動します。
 2. **アドオン管理 → Voice TTS** で「TTS エンジン」を `gpt_sovits` にします。
 3. 「GPT-SoVITS 外部サーバー URL」にサーバーの URL (例: `http://192.168.1.20:8082`) を入力します。全体設定と、ペルソナ別の上書き URL が使えます。
-4. 各ペルソナの参照音声と書き起こしを設定します。プロファイル ID はペルソナ ID です。合成時に、サーバーにそのプロファイルが無いとき、またはサーバー側の書き起こしや手元の参照音声が変わっていたときは、手元の参照音声と書き起こしを送って登録し直します (手元の設定が正です)。サーバーに登録済みのペルソナは、参照音声を設定しなくても使えます。
-5. 必要ならタイムアウトを変更します (既定 15 秒、1〜120 秒)。プロファイル確認・登録・合成の各 HTTP 要求に適用します。
+4. 各ペルソナの参照音声と書き起こしを設定します (WAV / mp3 / flac / ogg、長さは 3〜10 秒)。プロファイル ID はペルソナ ID です。合成時に、サーバーにそのプロファイルが無いとき、またはサーバー側の書き起こしや手元の参照音声が変わっていたときは、手元の参照音声と書き起こしを送って登録し直します (手元の設定が正です)。サーバーに登録済みのペルソナは、参照音声を設定しなくても使えます。
+5. 必要ならタイムアウトを変更します (既定 15 秒、1〜120 秒)。声を受け取っている間は、データとデータの間の待ち時間の上限として効きます。
 
-外部サーバーを使うクライアント側では GPT-SoVITS の専用 Python 環境やモデルは不要です。URL・タイムアウトの設定変更は次の合成で反映されます。URL を空欄に戻すと、導入済みのローカルエンジンに切り替わります。外部サーバーとの通信失敗時はログと既存の音声失敗通知を出します。
+声を聞く側の PC では、GPT-SoVITS の専用 Python 環境やモデルは不要です。URL・タイムアウトの設定変更は次の合成で反映されます。URL を空欄に戻すと、導入済みのローカルエンジンに切り替わります。外部サーバーとの通信失敗時はログと既存の音声失敗通知を出します。
 
-接続先の準備は `GET {URL}/health` の `{"ok": true}` で確認できます。合成に成功すると WAV が保存され、吹き出しの音声が再生可能になります。サーバーは各要求の完成 WAV を一括で返すため、サーバー内部の逐次推論には対応していません。文ごとの音声連結・ブラウザ配信は既存の経路を使います。
+### サーバーとのやり取り
+
+自作のサーバーをつなぐ場合や、他のプログラムからこのサーバーを使う場合の参考です。GPT-SoVITS 本体の標準 API とは別のものです。
+
+- `GET /health` → `{"ok": true, "model_loaded": bool, "device": "...", "engine": "gpt_sovits", "protocol": 2}`
+- `GET /profiles/{profile_id}` → `{"exists": true, "ref_text": "..."}` または 404
+- `PUT /profiles/{profile_id}` (multipart: `ref_audio` ファイル + `ref_text`) → `{"ok": true}`
+- `POST /synthesize` (JSON: `profile_id`, `text`) → 完成した WAV
+  - `"params": {...}` を付けると、その調整値 (話速など) で合成します。
+  - `"stream": true` を付けると、声ができた分から順に返します (形式は `tools/speak/engine/subprocess_ipc.py`)。
+
+`/health` が `protocol` を返さない古いサーバーにもつなげます。その場合は完成した WAV を一括で受け取り、ペルソナ別の調整値は効きません (ログに一度だけ残します)。
 
 ## Irodori-TTS を使う
 

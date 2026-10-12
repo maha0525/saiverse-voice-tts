@@ -93,6 +93,8 @@ class GPTSoVITSEngine(TTSEngine):
         super().__init__(engine_config)
         self._tts = None
         self._last_ref: Optional[str] = None
+        # 読み込み後に実際に使っている device (音声合成サーバーの /health が報告する)
+        self.device: Optional[str] = None
         self._ref_language = self.config.get("ref_language", "ja")
         self._target_language = self.config.get("target_language", "ja")
 
@@ -202,6 +204,7 @@ class GPTSoVITSEngine(TTSEngine):
                 )
 
             self._tts = TTS(cfg)
+            self.device = device
 
     def _build_inputs(
         self,
