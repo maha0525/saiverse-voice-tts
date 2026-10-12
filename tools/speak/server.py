@@ -64,7 +64,11 @@ _PACK_ROOT = _SPEAK_DIR.parent.parent
 _CONFIG_PATH = _PACK_ROOT / "config" / "default.json"
 _CONFIG_TEMPLATE_PATH = _PACK_ROOT / "config" / "default.json.template"
 
-_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# この形の ID はそのままフォルダ名にする (従来のサーバーと同じ置き方で、
+# 今の登録を引き継げる)。それ以外の ID (2026-08 より前に作られた日本語の
+# ペルソナ ID など) は、ID のハッシュをフォルダ名にする。
+_PLAIN_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MAX_PROFILE_ID_CHARS = 128
 _EXTENSION_RE = re.compile(r"^\.[a-z0-9]{1,8}$")
 # 設定画面と同じ上限
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -228,13 +232,36 @@ class SynthesisService:
 
     @staticmethod
     def validate_profile_id(profile_id: str) -> str:
-        if not _PROFILE_ID_RE.match(profile_id or ""):
-            raise RequestError(400, "profile_id must match ^[A-Za-z0-9_-]{1,64}$")
+        """ペルソナ ID をプロファイル ID として受け付けるか確かめる。
+
+        英数字に限らない (日本語のペルソナ ID もある)。フォルダ名に素で使うのは
+        英数字の ID だけなので (``profile_dir``)、ここでは区切り文字・制御文字・
+        前後の空白・長さだけを断る。
+        """
+        if (
+            not profile_id
+            or len(profile_id) > MAX_PROFILE_ID_CHARS
+            or profile_id != profile_id.strip()
+            or profile_id in (".", "..")
+            or any(ch in "/\\" or ord(ch) < 32 or ord(ch) == 127 for ch in profile_id)
+        ):
+            raise RequestError(
+                400,
+                f"profile_id must be 1-{MAX_PROFILE_ID_CHARS} characters without "
+                "slashes, control characters or surrounding spaces",
+            )
         return profile_id
+
+    def profile_dir(self, profile_id: str) -> Path:
+        """プロファイルのフォルダ。英数字の ID はそのまま、それ以外はハッシュの名前。"""
+        if _PLAIN_PROFILE_ID_RE.match(profile_id):
+            return self.profiles_dir / profile_id
+        digest = hashlib.sha256(profile_id.encode("utf-8")).hexdigest()[:32]
+        return self.profiles_dir / f"id_{digest}"
 
     def read_profile(self, profile_id: str) -> Optional[Tuple[Path, str]]:
         """登録済みなら (参照音声の絶対パス, 書き起こし)。参照音声が無ければ未登録扱い。"""
-        profile_dir = self.profiles_dir / profile_id
+        profile_dir = self.profile_dir(profile_id)
         try:
             data = json.loads((profile_dir / "profile.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -259,7 +286,7 @@ class SynthesisService:
         if not audio:
             raise RequestError(400, "ref_audio is empty")
         with self.lock:
-            profile_dir = self.profiles_dir / profile_id
+            profile_dir = self.profile_dir(profile_id)
             original_ext = Path(filename or "").suffix.lower()
             # 確かめる前は profiles/ の直下に置く (断った登録でフォルダを残さない)
             fd, tmp_name = tempfile.mkstemp(dir=str(self.profiles_dir), prefix=".upload_", suffix=original_ext)
@@ -296,7 +323,10 @@ class SynthesisService:
                         pass
             _atomic_write(
                 profile_dir / "profile.json",
-                json.dumps({"ref_audio": ref_name, "ref_text": ref_text}, ensure_ascii=False).encode("utf-8"),
+                json.dumps(
+                    {"ref_audio": ref_name, "ref_text": ref_text, "profile_id": profile_id},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
             )
             _atomic_write(profile_dir / "ref_text.txt", ref_text.encode("utf-8"))
             for old in profile_dir.glob("ref_*"):

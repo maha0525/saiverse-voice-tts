@@ -113,12 +113,36 @@ class SynthesisServerTests(unittest.TestCase):
         # nothing half-written is left behind
         self.assertEqual(list((self.srv.data_dir / "profiles").glob(".upload_*")), [])
 
+    def test_non_ascii_persona_id_registers_and_speaks(self):
+        """Personas created before the ASCII ID rule keep Japanese IDs; they must work too."""
+        from urllib.parse import quote
+
+        profile_id = "ほしの"
+        response = requests.put(
+            f"{self.srv.url}/profiles/{quote(profile_id, safe='')}",
+            files={"ref_audio": ("ref.wav", make_audio(4.0))}, data={"ref_text": "参照音声です"},
+            timeout=10,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        folders = [p for p in (self.srv.data_dir / "profiles").iterdir() if p.is_dir()]
+        hashed = [p for p in folders if p.name.startswith("id_")]
+        self.assertEqual(len(hashed), 1)  # never a raw non-ASCII folder name
+        self.assertEqual(
+            json.loads((hashed[0] / "profile.json").read_text(encoding="utf-8"))["profile_id"],
+            profile_id,
+        )
+        lookup = requests.get(f"{self.srv.url}/profiles/{quote(profile_id, safe='')}", timeout=5)
+        self.assertEqual(lookup.json(), {"exists": True, "ref_text": "参照音声です"})
+        spoken = self._post({"profile_id": profile_id, "text": "こんにちは"})
+        self.assertEqual(spoken.status_code, 200)
+        self.assertEqual(spoken.headers["Content-Type"], "audio/wav")
+
     def test_bad_profile_id_and_oversized_upload(self):
         # Rejected before reading the upload; the connection stays usable
         with requests.Session() as session:
-            for _ in range(3):
+            for bad in ("bad%2Fid", "bad%5Cid", "%2E%2E", "%20padded", "x" * 129, "bad%0Aid"):
                 response = session.put(
-                    f"{self.srv.url}/profiles/bad.id",
+                    f"{self.srv.url}/profiles/{bad}",
                     files={"ref_audio": ("ref.wav", make_audio(4.0))}, data={"ref_text": "x"},
                     timeout=10,
                 )
@@ -177,7 +201,8 @@ class SynthesisServerTests(unittest.TestCase):
 
     def test_errors_before_the_first_frame_are_status_codes(self):
         cases = [
-            ({"profile_id": "bad id", "text": "x"}, 400),
+            ({"profile_id": "bad/id", "text": "x"}, 400),
+            ({"profile_id": " padded", "text": "x"}, 400),
             ({"profile_id": "persona_1", "text": "   "}, 400),
             ({"profile_id": "persona_1", "text": "x", "params": [1]}, 400),
             ({"profile_id": "nobody", "text": "x"}, 404),
