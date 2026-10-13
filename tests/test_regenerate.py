@@ -54,13 +54,21 @@ def _make_app(manager: Any) -> FastAPI:
     # 既に登録されている dependency を上書きする (Depends factory が返した object を解決)
     # api_routes 側で `Depends(_get_manager_dep())` の形なので、対象 dependency 関数を
     # ルートから収集して上書きする。
-    for route in app.routes:
+    # app.routes ではなく api_routes.router.routes を走査する: FastAPI 0.141 以降、
+    # include_router した経路は app.routes 上で _IncludedRouter に包まれ、
+    # APIRoute (と dependant) が平たく並ばなくなったため。
+    for route in api_routes.router.routes:
         deps = getattr(route, "dependant", None)
         if deps is None:
             continue
         for sub in list(deps.dependencies):
             # depends factory の戻り値関数で manager を返すように差し替える
             app.dependency_overrides[sub.call] = _dep
+    # 差し替え先が一つも見つからないと、本物の get_manager が走ってテストの
+    # 前提が黙って崩れる。FastAPI の内部構造がまた変わったときに即座に気づけるよう、
+    # ここで明示的に落とす。
+    if not app.dependency_overrides:
+        raise RuntimeError("manager dependency not found on api_routes.router routes")
     return app
 
 
