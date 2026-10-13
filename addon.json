@@ -196,6 +196,18 @@
             "persona_configurable": true
         },
         {
+            "key": "speed",
+            "label": "話速",
+            "description": "音声合成の話速倍率 (1.0 が標準、0.5〜2.0)。GPT-SoVITS / OpenAI TTS で有効。",
+            "type": "number",
+            "value_type": "float",
+            "default": 1.0,
+            "min": 0.5,
+            "max": 2.0,
+            "step": 0.05,
+            "persona_configurable": true
+        },
+        {
             "key": "server_side_playback",
             "label": "サーバー側再生",
             "description": "バックエンドPCのスピーカーから自動再生します。ブラウザを開いていない環境で音を鳴らしたい場合などにONにします。デフォルトOFF。",
