@@ -32,36 +32,82 @@ class AddonManifestTests(unittest.TestCase):
         self.assertEqual(speed_schema.get("step"), 0.05)
         self.assertTrue(speed_schema.get("persona_configurable"))
 
+
+def _addon_config_like_host(overrides):
+    """Fake saiverse.addon_config whose get_params behaves like the host's.
+
+    The host starts from addon.json's params_schema defaults and layers the
+    saved global / persona values on top, so untouched fields come back with
+    their default values (not missing).
+    """
+    manifest = json.loads((_PACK_ROOT / "addon.json").read_text(encoding="utf-8"))
+    defaults = {
+        p["key"]: p["default"]
+        for p in manifest.get("params_schema", [])
+        if "key" in p and "default" in p
+    }
+    module = types.ModuleType("saiverse.addon_config")
+    module.get_params = lambda addon, persona_id=None: dict(
+        defaults, **overrides, _enabled=True
+    )
+    return module
+
+
+_REGISTRY = {
+    "registry_persona": {
+        "engine": "gpt_sovits",
+        "ref_audio": "samples/registry_persona/ref.wav",
+        "ref_text": "registry transcript",
+        "params": {"speed": 1.3, "top_k": 20},
+    },
+    "registry_api_persona": {
+        "engine": "openai_tts",
+        "params": {"openai_voice": "nova"},
+    },
+    "_default": {
+        "engine": "gpt_sovits",
+        "ref_audio": "samples/_default/ref.wav",
+        "ref_text": "default transcript",
+        "params": {"speed": 1.0},
+    },
+}
+
+
+class PersonaSpeedProfileTests(unittest.TestCase):
+    def _get_profile(self, persona_id, overrides):
+        from tools.speak import profiles
+
+        with patch.dict(
+            sys.modules, {"saiverse.addon_config": _addon_config_like_host(overrides)}
+        ), patch.object(profiles, "_load_registry", return_value=_REGISTRY):
+            return profiles.get_profile(persona_id)
+
     def test_speed_passes_through_to_persona_profile(self):
-        """speed configured in addon_config must be passed through to profile params."""
-        from tools.speak import profiles
-
-        addon_config = types.ModuleType("saiverse.addon_config")
-        addon_config.get_params = lambda addon, persona_id=None: {
-            "engine": "gpt_sovits",
+        """speed set together with a UI reference voice reaches the profile params."""
+        profile = self._get_profile("ui_persona", {
             "ref_audio": "samples/_default/ref.wav",
-            "ref_text": "テスト書き起こし",
+            "ref_text": "UI transcript",
             "speed": 1.35,
-        }
+        })
+        self.assertEqual(profile["params"].get("speed"), 1.35)
 
-        with patch.dict(sys.modules, {"saiverse.addon_config": addon_config}):
-            profile = profiles.get_profile("test_persona")
-            self.assertIsNotNone(profile)
-            self.assertEqual(profile["params"].get("speed"), 1.35)
+    def test_ui_speed_merged_into_registry_profile(self):
+        """speed set in the UI without a UI reference voice still applies to the registry voice."""
+        profile = self._get_profile("registry_persona", {"speed": 1.45})
+        self.assertTrue(profile["ref_audio"].endswith("ref.wav"))
+        self.assertEqual(profile["params"]["speed"], 1.45)
+        self.assertEqual(profile["params"]["top_k"], 20)
 
-    def test_speed_merged_into_registry_fallback_profile(self):
-        """speed configured in UI must be merged into registry-backed profile when ref_audio is omitted in UI."""
-        from tools.speak import profiles
+    def test_ui_speed_merged_into_default_profile(self):
+        """speed set in the UI also applies when the persona falls back to _default."""
+        profile = self._get_profile("unknown_persona", {"speed": 0.8})
+        self.assertTrue(profile.get("is_default_voice"))
+        self.assertEqual(profile["params"]["speed"], 0.8)
 
-        # Persona has speed override in UI, but no ref_audio (uses registry fallback)
-        addon_config = types.ModuleType("saiverse.addon_config")
-        addon_config.get_params = lambda addon, persona_id=None: {
-            "speed": 1.45,
-        }
+    def test_untouched_ui_fields_keep_registry_params(self):
+        """UI fields left at their addon.json defaults must not overwrite registry.json params."""
+        profile = self._get_profile("registry_persona", {})
+        self.assertEqual(profile["params"], {"speed": 1.3, "top_k": 20})
 
-        with patch.dict(sys.modules, {"saiverse.addon_config": addon_config}):
-            profile = profiles.get_profile("fallback_persona")
-            self.assertIsNotNone(profile, "Profile should fall back to registry/_default")
-            # Must retain registry audio while adopting the UI-configured speed
-            self.assertIsNotNone(profile.get("ref_audio"))
-            self.assertEqual(profile["params"].get("speed"), 1.45)
+        api_profile = self._get_profile("registry_api_persona", {})
+        self.assertEqual(api_profile["params"], {"openai_voice": "nova"})

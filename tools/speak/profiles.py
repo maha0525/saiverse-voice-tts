@@ -82,6 +82,12 @@ def _resolve_ref_audio(ref_audio: Optional[str]) -> Optional[str]:
 _API_ENGINES = {"openai_tts", "elevenlabs"}
 
 
+# 以下は合成パラメータ (profile の params) に含めず除外:
+# - addon フレームワーク内部 / UI トグル ( _enabled, server_side_playback 等)
+# - profile top-level に独立して載るもの (ref_audio, ref_text, engine)
+# - pronunciation_dict (addon UI ではグローバル設定。pronunciation_dict.py
+#   が直接ロードする)
+# - API key 系・外部サーバー接続設定 (engine が addon_config から fresh に解決する)
 _EXCLUDED_KEYS = {
     "_enabled", "ref_audio", "ref_text", "engine",
     "auto_speak", "server_side_playback", "client_side_playback",
@@ -91,11 +97,47 @@ _EXCLUDED_KEYS = {
     "gpt_sovits_remote_timeout_sec",
 }
 
+_cached_manifest_defaults: Optional[Dict[str, Any]] = None
+
 
 def _extract_synthesis_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not params:
         return {}
     return {k: v for k, v in params.items() if k not in _EXCLUDED_KEYS and v is not None}
+
+
+def _load_manifest_defaults() -> Dict[str, Any]:
+    """addon.json の params_schema の既定値 (key -> default)。"""
+    global _cached_manifest_defaults
+    if _cached_manifest_defaults is not None:
+        return _cached_manifest_defaults
+    defaults: Dict[str, Any] = {}
+    try:
+        manifest = json.loads((_PACK_ROOT / "addon.json").read_text(encoding="utf-8"))
+        for param in manifest.get("params_schema", []):
+            key = param.get("key")
+            if key and "default" in param:
+                defaults[key] = param["default"]
+    except Exception as exc:
+        LOGGER.warning("Failed to read params_schema defaults from addon.json: %s", exc)
+    _cached_manifest_defaults = defaults
+    return defaults
+
+
+def _changed_synthesis_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """UI で既定値から変えられた合成パラメータだけを返す。
+
+    host の get_params は、誰も触っていない欄にも addon.json の既定値を
+    入れて返す。既定値のままの欄まで registry.json のエントリに重ねると、
+    registry.json に書いた話速や声が黙って既定値に戻るため、既定値と
+    異なる値だけを重ねる対象にする。
+    """
+    defaults = _load_manifest_defaults()
+    return {
+        k: v
+        for k, v in _extract_synthesis_params(params).items()
+        if k not in defaults or v != defaults[k]
+    }
 
 
 def _load_addon_persona_params(persona_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -164,7 +206,7 @@ def get_profile(persona_id: Optional[str]) -> Optional[Dict[str, Any]]:
     profiles to match the local reference).
     """
     raw_params = _load_addon_persona_params(persona_id)
-    ui_synthesis_params = _extract_synthesis_params(raw_params)
+    ui_synthesis_params = _changed_synthesis_params(raw_params)
 
     # Tier 1: AddonPersonaConfig
     addon_profile = _build_addon_persona_profile(raw_params)
@@ -196,7 +238,8 @@ def get_profile(persona_id: Optional[str]) -> Optional[Dict[str, Any]]:
     if entry is None:
         return None
 
-    # Merge UI synthesis params (e.g. persona-configured speed) into fallback profile
+    # UI で既定値から変えられた合成パラメータ (ペルソナ別の話速など) だけを
+    # registry.json のエントリに重ねる。既定値のままの欄は registry.json を尊重する。
     if ui_synthesis_params:
         merged_params = dict(entry.get("params") or {})
         merged_params.update(ui_synthesis_params)
