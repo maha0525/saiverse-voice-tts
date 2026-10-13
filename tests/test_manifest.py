@@ -48,3 +48,20 @@ class AddonManifestTests(unittest.TestCase):
             profile = profiles.get_profile("test_persona")
             self.assertIsNotNone(profile)
             self.assertEqual(profile["params"].get("speed"), 1.35)
+
+    def test_speed_merged_into_registry_fallback_profile(self):
+        """speed configured in UI must be merged into registry-backed profile when ref_audio is omitted in UI."""
+        from tools.speak import profiles
+
+        # Persona has speed override in UI, but no ref_audio (uses registry fallback)
+        addon_config = types.ModuleType("saiverse.addon_config")
+        addon_config.get_params = lambda addon, persona_id=None: {
+            "speed": 1.45,
+        }
+
+        with patch.dict(sys.modules, {"saiverse.addon_config": addon_config}):
+            profile = profiles.get_profile("fallback_persona")
+            self.assertIsNotNone(profile, "Profile should fall back to registry/_default")
+            # Must retain registry audio while adopting the UI-configured speed
+            self.assertIsNotNone(profile.get("ref_audio"))
+            self.assertEqual(profile["params"].get("speed"), 1.45)
