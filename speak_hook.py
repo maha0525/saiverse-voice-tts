@@ -15,6 +15,7 @@ import logging
 from typing import Any
 
 from tools._loaded.speak.playback_worker import (
+    claim_message_voice,
     enqueue_tts,
     get_effective_params,
     notify_no_audio,
@@ -39,8 +40,10 @@ def on_persona_speak(
         message_id: Building history のメッセージ ID。バブル再生ボタンや
             ``audio_ready`` SSE イベントの紐付けキー。
         **_kwargs: ``text_raw`` / ``building_id`` / ``pulse_id`` / ``source`` /
-            ``metadata`` 等。本ハンドラでは未使用だが、本体側でペイロード項目が
-            増えても壊れないように受ける。
+            ``metadata`` / ``sub_seq`` / ``is_final`` 等。``building_id`` は
+            仮想身体の引き受け判定 (``claim_message_voice``) に、``pulse_id`` /
+            ``sub_seq`` / ``is_final`` は合成の依頼に使う。本体側でペイロード
+            項目が増えても壊れないように受ける。
     """
     if not persona_id or not message_id:
         return
@@ -75,6 +78,21 @@ def on_persona_speak(
     # subscriber 側 (frontend / stackchan) が同 pulse / 別 pulse の判定で
     # queue 末尾積み or 旧再生 preempt を切り替えるのに使う。
     pulse_id = _kwargs.get("pulse_id")
+
+    # 仮想身体 (Godot Vessel アドオン) が声を引き受ける発話は、ここでは合成
+    # しない。声は Godot アドオンが synthesize_piece で一切れずつ受け取り、
+    # 吹き出しの声は finish_message が付ける (付けられなければ
+    # notify_no_audio も finish_message 側が出す)。判定は message_id ごとに
+    # 最初の断片で一度だけ決まり、以降の断片 (締めの合図を含む) も同じ扱い。
+    if claim_message_voice(
+        persona_id, _kwargs.get("building_id"), message_id, pulse_id=pulse_id,
+    ):
+        LOGGER.debug(
+            "voice-tts speak_hook skipped: the vessel speaks this message "
+            "(persona=%s msg=%s is_final=%s)",
+            persona_id, message_id, _kwargs.get("is_final", True),
+        )
+        return
 
     # Pipeline Streaming (Phase 2-α): sea runtime が文区切りごとに sub-speak
     # を発火する経路で、 同 message_id に複数 sub-text が連続 enqueue される。

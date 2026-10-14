@@ -347,6 +347,7 @@ v0.4.0 以降は本体側の **`server_hooks`** 機構経由で `persona_speak` 
 拡張パック: speak_hook.on_persona_speak
    │
    ├─ get_effective_params(persona_id) で auto_speak チェック
+   ├─ claim_message_voice(...) が真なら何もせず戻る  ← 仮想身体が声を引き受けた発話
    ├─ clean_text_for_tts(text_for_voice)
    └─ enqueue_tts(cleaned, persona_id, message_id)  ← 既存の TTS Worker キューへ
 ```
@@ -367,6 +368,28 @@ v0.4.0 以降は本体側の **`server_hooks`** 機構経由で `persona_speak` 
 本体は本パックが有効化されている時のみハンドラを register し、無効化トグルで
 unregister する。ハンドラが例外を投げても本体側で隔離されるため、発話処理本体
 が止まることはない。
+
+### 仮想身体 (Godot Vessel アドオン) への声の受け渡し
+
+ペルソナが仮想身体の部屋にいて Godot の Vessel が接続中の間、声は VR の
+アバターからだけ鳴らす (SAIVerse 本体 `docs/intent/virtual_embodiment_godot.md`
+の「声は voice-tts から一切れずつ受け取る」)。他のアドオンは
+`sys.modules.get("tools._loaded.speak.playback_worker")` でこの API に届く。
+
+- `register_voice_claim(fn)` / `unregister_voice_claim(fn)`: Godot アドオンが
+  `fn(persona_id, building_id) -> bool` を登録する。`speak_hook` は message_id
+  ごとの最初の断片で `claim_message_voice` を呼び、真ならその発話を通常の合成
+  キューへ入れない (締めの合図も含めて、判定は発話の途中で変えない)。
+- `synthesize_piece(persona_id, text, *, message_id, timeout)`: Godot アドオンが
+  全身エモート記法で区切った一切れを、既存のワーカースレッドで非ストリーミング
+  合成し `(WAV バイト列, 秒数)` を返す。声プロファイル・合成パラメータ・読み方の
+  辞書・`clean_text_for_tts` は `_process` と同じ (`_prepare_synthesis` を共有)。
+  アドオン無効・`auto_speak` OFF・声プロファイル無しは `VoiceUnavailable`、時間切れは
+  `TimeoutError`。再生・audio_stream・通知・保存はしない。
+- `finish_message(message_id, *, complete, pulse_id=None)`: 切れ端を依頼順につないで
+  保存し、`audio_completed` (画面の自動再生が購読しない) で吹き出しに声を付ける。
+  欠けた切れ端があるか `complete=False` なら `notify_no_audio`。
+- `finish_message` が来ない発話は 600 秒で `notify_no_audio` して捨てる。
 
 ### 旧 Playbook 上書き方式 (v0.3.x まで)
 
