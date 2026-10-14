@@ -7,20 +7,26 @@ Tool caller's perspective.
 from __future__ import annotations
 
 import atexit
+import io
 import json
 import logging
 import queue
 import threading
 import time
 import uuid
+import wave
+from collections import OrderedDict
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as _FutureTimeout
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
 from .engine import TTSEngine, create_engine
 from .profiles import get_profile
+from .text_cleaner import clean_text_for_tts
 from . import audio_stream
 
 LOGGER = logging.getLogger(__name__)
@@ -385,6 +391,60 @@ class _Job:
     is_final: bool = True
 
 
+class VoiceUnavailable(Exception):
+    """``synthesize_piece`` がこのペルソナの声を作らない (待っても声は来ない)。
+
+    アドオンが無効・そのペルソナの ``auto_speak`` が OFF・声プロファイルが無い・
+    整形後に読み上げる文字が残らない、のいずれか。
+    """
+
+
+class NothingToVoice(VoiceUnavailable):
+    """``synthesize_piece`` に渡した区切りが、整形 (``clean_text_for_tts``) か
+    読み方の辞書 (``_apply_pronunciation``) を当てると読み上げる文字を残さない。
+
+    もともと声の無い区切りなので、その発話の欠けとしては数えない
+    (吹き出しの声は他の切れ端だけで付く)。
+    """
+
+
+class _EngineInitError(Exception):
+    """``_TTSWorker._prepare_synthesis`` でエンジンの初期化に失敗した。"""
+
+    def __init__(self, engine_name: str, cause: Exception) -> None:
+        super().__init__(f"engine '{engine_name}' failed to initialize: {cause}")
+        self.engine_name = engine_name
+        self.cause = cause
+
+
+@dataclass
+class _SynthesisSetup:
+    """``_process`` と ``_process_piece`` が共有する、合成前の解決結果。"""
+    profile: Dict[str, Any]
+    cfg: Dict[str, Any]
+    effective: Dict[str, Any]
+    engine_name: str
+    engine: TTSEngine
+    params: Dict[str, Any]
+    ref_audio: Optional[str]
+    ref_text: Optional[str]
+
+
+@dataclass
+class _PieceJob:
+    """``synthesize_piece`` の依頼。通常の ``_Job`` と同じ ``_queue`` に並べ、
+    同じワーカースレッドで処理する (エンジンを同時に二重に使わないため)。
+
+    結果は ``future`` に ``(mono float32 の音声, sample_rate)`` で返す。
+    依頼側は時間切れで ``future.cancel()`` するので、ワーカーは処理の前に
+    ``set_running_or_notify_cancel()`` で取り消しを確かめる。
+    """
+    persona_id: str
+    text: str
+    message_id: str
+    future: "Future[Tuple[np.ndarray, int]]"
+
+
 @dataclass
 class _MessageState:
     """同 message_id の sub-text 群 (= sub_seq=1, 2, ...) で共有する状態。
@@ -418,7 +478,7 @@ class _MessageState:
 
 class _TTSWorker:
     def __init__(self) -> None:
-        self._queue: "queue.Queue[Optional[_Job]]" = queue.Queue()
+        self._queue: "queue.Queue[Optional[Union[_Job, _PieceJob]]]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         # (engine name, remote transport) -> engine. transport is () for the
@@ -833,6 +893,127 @@ class _TTSWorker:
             except OSError:
                 pass
 
+    def _prepare_synthesis(self, persona_id: Optional[str]) -> _SynthesisSetup:
+        """声プロファイル・エンジン・合成パラメータ・参照音声を解決する。
+
+        ``_process`` (画面向けの通常合成) と ``_process_piece`` (仮想身体向けの
+        一切れの合成) が同じ解決を使うための共通部分。
+
+        Raises:
+            VoiceUnavailable: 声プロファイルが無い (``_default`` も無い)。
+            _EngineInitError: エンジンの初期化に失敗した。
+        """
+        profile = get_profile(persona_id)
+        if profile is None:
+            LOGGER.info(
+                "No voice profile for persona_id=%s (and no _default); skipping TTS.",
+                persona_id,
+            )
+            raise VoiceUnavailable("no voice profile")
+
+        cfg = self._load_config()
+        engine_name = profile.get("engine") or cfg.get("default_engine", "gpt_sovits")
+        effective = _get_effective_params(persona_id)
+        try:
+            engine = self._get_engine(engine_name, effective)
+        except Exception as exc:
+            LOGGER.error("Failed to initialize engine '%s': %s", engine_name, exc)
+            raise _EngineInitError(engine_name, exc) from exc
+
+        synthesis_params = dict(profile.get("params") or {})
+        if persona_id:
+            synthesis_params["persona_id"] = persona_id
+        ref_audio = profile.get("ref_audio")
+        ref_text = profile.get("ref_text")
+        if profile.get("is_default_voice") and getattr(engine, "stores_reference_by_persona", False):
+            # 見本の声をこのペルソナの ID で外部サーバーに登録しない (共有サーバー
+            # 上の本人の声を上書きしうる)。サーバー登録済みのプロファイルで合成する。
+            LOGGER.debug(
+                "persona=%s has only the sample voice; using the server's profile as is",
+                persona_id,
+            )
+            ref_audio = ref_text = None
+        return _SynthesisSetup(
+            profile=profile,
+            cfg=cfg,
+            effective=effective,
+            engine_name=engine_name,
+            engine=engine,
+            params=synthesis_params,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+        )
+
+    @staticmethod
+    def _apply_pronunciation(
+        text: str, profile: Dict[str, Any], persona_id: Optional[str]
+    ) -> str:
+        # ユーザー読み方辞書の適用 (TTS engine に渡す直前に文字列置換)。
+        # global 辞書 + ペルソナ別オーバーライド (registry の pronunciation_dict)
+        # が両方ある場合は persona の方が先に適用される。
+        from . import pronunciation_dict as _pd
+        persona_dict = profile.get("pronunciation_dict")
+        tts_text = _pd.apply(text, persona_dict=persona_dict)
+        if tts_text != text:
+            LOGGER.debug(
+                "pronunciation_dict applied: %d -> %d chars (persona=%s)",
+                len(text), len(tts_text), persona_id,
+            )
+        return tts_text
+
+    def _process_piece(self, job: _PieceJob) -> None:
+        """``synthesize_piece`` の一切れを合成して ``job.future`` へ返す。
+
+        再生・audio_stream への配信・画面への通知・ファイル保存はしない
+        (吹き出しの声は ``finish_message`` がまとめて作る)。
+        """
+        if not job.future.set_running_or_notify_cancel():
+            LOGGER.debug("voice piece cancelled before synthesis (msg=%s)", job.message_id)
+            return
+        try:
+            # 依頼の受付時 (synthesize_piece) と実際に始める今の間に、アドオンの
+            # 無効化や auto_speak の OFF が挟まりうる (前の合成を待っている間)。
+            # 始める時点の設定で改めて確かめ、エンジンの初期化より前に断る。
+            effective = _get_effective_params(job.persona_id)
+            if not effective.get("_enabled", True):
+                raise VoiceUnavailable("voice-tts addon is disabled")
+            if not effective.get("auto_speak", True):
+                raise VoiceUnavailable("auto_speak is off for this persona")
+            setup = self._prepare_synthesis(job.persona_id)
+            cleaned = clean_text_for_tts(job.text)
+            tts_text = self._apply_pronunciation(cleaned, setup.profile, job.persona_id)
+            if not tts_text.strip():
+                # 読み方の辞書で消える区切りも、synthesize_piece の入口の
+                # NothingToVoice と同じく、もともと声の無い区切りとして扱う
+                raise NothingToVoice("no voiceable text in this piece")
+            result = setup.engine.synthesize(
+                text=tts_text,
+                ref_audio=setup.ref_audio,
+                ref_text=setup.ref_text,
+                params=setup.params,
+            )
+            audio = _mono_float32(result.audio)
+            if audio.size == 0:
+                raise RuntimeError("synthesis produced no audio")
+            sample_rate = int(result.sample_rate)
+            if sample_rate <= 0:
+                raise RuntimeError("synthesis returned an invalid sample rate")
+        except NothingToVoice as exc:
+            LOGGER.debug(
+                "voice piece has nothing to voice after the pronunciation dict "
+                "(persona=%s msg=%s)", job.persona_id, job.message_id,
+            )
+            job.future.set_exception(exc)
+            return
+        except Exception as exc:
+            LOGGER.warning(
+                "voice piece synthesis failed (persona=%s msg=%s): %s",
+                job.persona_id, job.message_id, type(exc).__name__,
+            )
+            job.future.set_exception(exc)
+            return
+        job.future.set_result((audio, sample_rate))
+
     def _process(self, job: _Job) -> None:
         # Pipeline Streaming finalize-only signal: text="" + is_final=True
         # の job は 「合成は不要、 既存 _MessageState を閉じて wav 保存だけ」
@@ -858,42 +1039,26 @@ class _TTSWorker:
             self._finalize_message_state(state, job.message_id, job.pulse_id)
             return
 
-        profile = get_profile(job.persona_id)
-        if profile is None:
-            LOGGER.info(
-                "No voice profile for persona_id=%s (and no _default); skipping TTS.",
-                job.persona_id,
-            )
+        try:
+            setup = self._prepare_synthesis(job.persona_id)
+        except VoiceUnavailable:
             notify_no_audio(job.message_id, "no voice profile", pulse_id=job.pulse_id)
             return
-
-        cfg = self._load_config()
-        engine_name = profile.get("engine") or cfg.get("default_engine", "gpt_sovits")
-        effective = _get_effective_params(job.persona_id)
-        try:
-            engine = self._get_engine(engine_name, effective)
-        except Exception as exc:
-            LOGGER.error("Failed to initialize engine '%s': %s", engine_name, exc)
+        except _EngineInitError as exc:
             notify_no_audio(
                 job.message_id,
-                f"engine '{engine_name}' failed to initialize: {exc}",
+                f"engine '{exc.engine_name}' failed to initialize: {exc.cause}",
                 pulse_id=job.pulse_id,
             )
             return
-
-        synthesis_params = dict(profile.get("params") or {})
-        if job.persona_id:
-            synthesis_params["persona_id"] = job.persona_id
-        ref_audio = profile.get("ref_audio")
-        ref_text = profile.get("ref_text")
-        if profile.get("is_default_voice") and getattr(engine, "stores_reference_by_persona", False):
-            # 見本の声をこのペルソナの ID で外部サーバーに登録しない (共有サーバー
-            # 上の本人の声を上書きしうる)。サーバー登録済みのプロファイルで合成する。
-            LOGGER.debug(
-                "persona=%s has only the sample voice; using the server's profile as is",
-                job.persona_id,
-            )
-            ref_audio = ref_text = None
+        profile = setup.profile
+        cfg = setup.cfg
+        engine_name = setup.engine_name
+        effective = setup.effective
+        engine = setup.engine
+        synthesis_params = setup.params
+        ref_audio = setup.ref_audio
+        ref_text = setup.ref_text
         LOGGER.debug(
             "effective addon params for persona=%s: streaming=%s server_side=%s enabled=%s",
             job.persona_id,
@@ -913,17 +1078,7 @@ class _TTSWorker:
         if resolved_device is None:
             resolved_device = _parse_output_device(cfg.get("output_device"))
 
-        # ユーザー読み方辞書の適用 (TTS engine に渡す直前に文字列置換)。
-        # global 辞書 + ペルソナ別オーバーライド (registry の pronunciation_dict)
-        # が両方ある場合は persona の方が先に適用される。
-        from . import pronunciation_dict as _pd
-        persona_dict = profile.get("pronunciation_dict")
-        tts_text = _pd.apply(job.text, persona_dict=persona_dict)
-        if tts_text != job.text:
-            LOGGER.debug(
-                "pronunciation_dict applied: %d -> %d chars (persona=%s)",
-                len(job.text), len(tts_text), job.persona_id,
-            )
+        tts_text = self._apply_pronunciation(job.text, profile, job.persona_id)
 
         if use_streaming:
             ok = self._play_streaming(
@@ -993,7 +1148,10 @@ class _TTSWorker:
             if job is None:
                 break
             try:
-                self._process(job)
+                if isinstance(job, _PieceJob):
+                    self._process_piece(job)
+                else:
+                    self._process(job)
             except Exception:
                 LOGGER.exception("Unhandled error in TTS worker")
             finally:
@@ -1087,4 +1245,553 @@ def enqueue_tts(
         text, persona_id,
         message_id=message_id, pulse_id=pulse_id,
         sub_seq=sub_seq, is_final=is_final,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 仮想身体 (Godot Vessel アドオン) への声の受け渡し
+#
+# ペルソナが仮想身体の部屋にいて Vessel が接続中の間、声は仮想身体のアバター
+# からだけ鳴らす。設計: SAIVerse 本体 docs/intent/virtual_embodiment_godot.md
+# の「声は voice-tts から一切れずつ受け取る」。
+#
+# - Godot アドオンは ``register_voice_claim`` で判定関数を登録する。
+#   ``speak_hook.on_persona_speak`` と Godot アドオンは断片ごとに
+#   ``claim_message_voice`` を呼ぶ。判定は message_id ごとに最初の一回で決まり、
+#   真ならその発話を通常の合成 (ブラウザ・サーバーのスピーカー) に流さない。
+# - Godot アドオンは全身エモート記法で区切った文を一つずつ
+#   ``synthesize_piece`` に渡し、WAV を受け取る。合成は既存のワーカースレッドで
+#   行う。
+# - 最後の区切りを配送したら ``finish_message`` を呼ぶ。voice-tts は切れ端を
+#   順につないで吹き出しの「音声を再生」に付ける (自動再生しない
+#   ``audio_completed``)。一切れでも欠けたら ``notify_no_audio``。
+#
+# message_id ごとの記録 (``_VesselMessage``) は ``_vessel_messages`` 一つにだけ
+# 持ち、その ``state`` が次のように移る:
+#
+#   (記録なし) --claim_message_voice が偽--> "unclaimed"  通常の合成が吹き出しを持つ
+#   (記録なし) --claim_message_voice が真--> "open"       finish_message 側が吹き出しを持つ
+#   "open" --finish_message / 期限切れ / 上限での追い出し--> "closed"
+#
+# - 記録を作るのは ``claim_message_voice`` だけ。一度決まった判定 ("unclaimed"
+#   か、それ以外か) は変わらない。
+# - 吹き出しへの結末の知らせ (``audio_completed`` か ``notify_no_audio``) を
+#   出すのは、"open" から "closed" へ移る一回だけ。
+# - "unclaimed" と "closed" は終わった状態。その後に来た切れ端は声を返すだけで、
+#   記録にも吹き出しにも触らない。
+# ---------------------------------------------------------------------------
+
+#: "open" の発話を、触られない (断片・切れ端・締めのどれも来ない) まま持ち続ける
+#: 上限秒数。過ぎたら "closed" にし、``notify_no_audio`` を出す。
+#: ただし ``register_voice_claim`` の ``holds(message_id)`` のどれかが真を返す
+#: 発話 (アドオンがまだ順番待ちか処理中で、いずれ ``finish_message`` を呼ぶ) は
+#: 閉じずに触り直す。アドオン自身の合成待ちが長くても、締めを待ち続けられる。
+#: なのでこの期限は、答えなくなったアドオン (プロセスが落ちた・アドオンが外れた、
+#: または ``holds`` を登録していない) のための最後の網でしかない。
+#: 画面の待ち表示はフロントが 300 秒で自分から消すので、長くしても待ち表示が
+#: 残り続けることはない。
+_VESSEL_MESSAGE_TTL_SEC = 3600.0
+#: 期限切れを見回るスレッド (``_run_vessel_sweeper``) の起床間隔 (秒)。
+_VESSEL_SWEEP_INTERVAL_SEC = 30.0
+#: ``_vessel_messages`` の件数の目安。超えたら、終わってから
+#: ``_VESSEL_RETAIN_TERMINAL_SEC`` 以上たった記録を捨てる
+#: (``_evict_over_capacity_locked``)。"open" の記録は件数では捨てない。
+_VESSEL_MESSAGE_MAX = 4096
+#: 終わった記録 ("unclaimed" / "closed") を残しておく秒数 (1 日)。
+_VESSEL_RETAIN_TERMINAL_SEC = 86400.0
+
+_VESSEL_UNCLAIMED = "unclaimed"
+_VESSEL_OPEN = "open"
+_VESSEL_CLOSED = "closed"
+
+
+@dataclass
+class _VesselMessage:
+    """一つの発話の、仮想身体への声の受け渡しの記録。
+
+    ``state`` は ``_VESSEL_UNCLAIMED`` / ``_VESSEL_OPEN`` / ``_VESSEL_CLOSED``
+    (この節の冒頭の図を参照)。``pieces`` の各要素は依頼順の枠で、合成が成功
+    したら ``(mono float32 の音声, sample_rate)`` が入る。失敗・時間切れの枠は
+    ``None`` のまま残り、``broken`` が立つ。ワーカーが ``NothingToVoice`` を
+    返した枠 (読み方の辞書を当てると読み上げる文字が残らない) は ``skipped`` に
+    番号を入れ、``finish_message`` はその枠を除いてつなぐ。"closed" になったら
+    ``pieces`` は空にする (音声を持ち続けない)。
+    """
+    state: str
+    created_at: float
+    touched_at: float
+    pulse_id: Optional[str] = None
+    pieces: List[Optional[Tuple[np.ndarray, int]]] = field(default_factory=list)
+    skipped: Set[int] = field(default_factory=set)
+    broken: bool = False
+
+
+@dataclass
+class _VesselSweeper:
+    """"open" の記録の期限切れを、API の呼び出しが無くても見回るスレッド。"""
+    thread: threading.Thread
+    stop: threading.Event
+
+
+# _voice_claims・_vessel_messages・_vessel_sweeper を守る。判定関数
+# (_is_voice_claimed)・``holds`` (_vessel_held_by_addon) と吹き出しへの知らせ
+# (notify_no_audio / _notify_audio_ready) は、このロックを持ったまま呼ばない。
+_vessel_lock = threading.Lock()
+# claim_message_voice の判定を一件ずつ順に行う。同じ message_id の最初の断片が
+# 同時に来ても、判定関数は一回だけ走る。取る順は _vessel_decision_lock →
+# _vessel_lock で、逆順には取らない。
+_vessel_decision_lock = threading.Lock()
+# 登録された (判定関数, holds) の組。holds は登録されていなければ None。
+_voice_claims: List[Tuple[Callable[[str, str], bool], Optional[Callable[[str], bool]]]] = []
+# 並びは触った順 (先頭が最も古い)。上限超過時は先頭から捨てる。
+_vessel_messages: "OrderedDict[str, _VesselMessage]" = OrderedDict()
+# 動いている見回りスレッド。"open" の記録が無くなると自分で抜けて None に戻し、
+# 次に記録が "open" になったときに改めて起こす (_ensure_vessel_sweeper_locked)。
+_vessel_sweeper: Optional[_VesselSweeper] = None
+
+# 吹き出しへ notify_no_audio で知らせる、閉じた発話 (message_id, pulse_id,
+# 切れ端の数, 理由)
+_ClosedNotice = Tuple[str, Optional[str], int, str]
+
+
+def _mono_float32(audio: Any) -> np.ndarray:
+    """エンジンの戻り値 (float32 または整数 PCM) を一次元の float32 にする。"""
+    arr = np.asarray(audio)
+    if np.issubdtype(arr.dtype, np.integer):
+        arr = arr.astype(np.float32) / float(np.iinfo(arr.dtype).max + 1)
+    else:
+        arr = arr.astype(np.float32, copy=False)
+    if arr.ndim > 1:
+        # _play_streaming と同じ扱い (エンジンは mono を返す前提)
+        arr = arr.reshape(-1)
+    return arr
+
+
+def _wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
+    """mono float32 の音声を 16-bit PCM の WAV バイト列にする。"""
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(_TTSWorker._to_int16_bytes(audio))
+    return out.getvalue()
+
+
+def register_voice_claim(
+    fn: Callable[[str, str], bool],
+    holds: Optional[Callable[[str], bool]] = None,
+) -> None:
+    """発話の声を仮想身体が引き受けるかの判定関数を登録する。
+
+    ``fn(persona_id, building_id)`` が真を返した発話は、voice-tts の通常の
+    合成 (ブラウザ・サーバーのスピーカー) に流さない。
+
+    ``holds(message_id)`` は「このアドオンはこの発話をまだ順番待ちか処理中で
+    持っていて、いずれ ``finish_message`` を呼ぶ」に答える。真を返す発話は
+    ``_VESSEL_MESSAGE_TTL_SEC`` を過ぎても期限切れで閉じない
+    (``_expire_vessel_messages``)。
+
+    同じ関数オブジェクトの二度目の登録は何もしない (``holds`` も差し替えない)。
+    """
+    with _vessel_lock:
+        if not any(existing is fn for existing, _ in _voice_claims):
+            _voice_claims.append((fn, holds))
+
+
+def unregister_voice_claim(fn: Callable[[str, str], bool]) -> None:
+    """``register_voice_claim`` で登録した判定関数を、その ``holds`` ごと外す。
+
+    未登録なら何もしない。
+    """
+    with _vessel_lock:
+        _voice_claims[:] = [pair for pair in _voice_claims if pair[0] is not fn]
+
+
+def _is_voice_claimed(persona_id: str, building_id: str) -> bool:
+    """登録された判定関数のどれかが真なら真。例外は記録して偽として扱う。
+
+    判定関数は他のアドオンのコードなので、``_vessel_lock`` を持たずに呼ぶ。
+    """
+    with _vessel_lock:
+        claims = [fn for fn, _ in _voice_claims]
+    for fn in claims:
+        try:
+            if fn(persona_id, building_id):
+                return True
+        except Exception:
+            LOGGER.exception(
+                "voice claim check failed (persona=%s building=%s)",
+                persona_id, building_id,
+            )
+    return False
+
+
+def _touch_locked(message_id: str, entry: _VesselMessage, now: float) -> None:
+    """記録を触った時刻を更新し、上限超過時に捨てる順の末尾へ回す。
+
+    ``entry`` が既に ``_vessel_messages`` から追い出されていれば並びは触らない。
+    ``_vessel_lock`` を持った状態で呼ぶ。
+    """
+    entry.touched_at = now
+    if _vessel_messages.get(message_id) is entry:
+        _vessel_messages.move_to_end(message_id)
+
+
+def _close_locked(message_id: str, entry: _VesselMessage, now: float) -> None:
+    """記録を "closed" にする。``_vessel_lock`` を持った状態で呼ぶ。"""
+    entry.state = _VESSEL_CLOSED
+    entry.pieces = []
+    _touch_locked(message_id, entry, now)
+
+
+def _notify_closed(notices: List[_ClosedNotice]) -> None:
+    """``finish_message`` を待たずに閉じた発話の吹き出しへ、声が無いことを知らせる。
+
+    ``_vessel_lock`` を持たずに呼ぶ。
+    """
+    for message_id, pulse_id, piece_count, reason in notices:
+        LOGGER.warning(
+            "vessel voice for msg=%s closed without finish_message: %s (pieces=%d)",
+            message_id, reason, piece_count,
+        )
+        notify_no_audio(message_id, reason, pulse_id=pulse_id)
+
+
+def _vessel_held_by_addon(message_id: str) -> bool:
+    """登録された ``holds`` のどれかがこの発話を持っていると答えれば真。
+
+    例外は記録して偽として扱う。``holds`` は他のアドオンのコードなので、
+    ``_vessel_lock`` を持たずに呼ぶ。
+    """
+    with _vessel_lock:
+        holders = [holds for _, holds in _voice_claims if holds is not None]
+    for holds in holders:
+        try:
+            if holds(message_id):
+                return True
+        except Exception:
+            LOGGER.exception("vessel holds check failed (msg=%s)", message_id)
+    return False
+
+
+def _expire_vessel_messages() -> None:
+    """触られないまま ``_VESSEL_MESSAGE_TTL_SEC`` を過ぎた "open" の発話を閉じる。
+
+    閉じる前に ``_vessel_held_by_addon`` に尋ね、アドオンがまだ持っている発話は
+    閉じずに触り直す。閉じた発話の吹き出しには ``notify_no_audio`` で待ち表示を
+    解かせる。見回りスレッド (``_run_vessel_sweeper``) と各 API の入口から呼ばれる。
+    """
+    now = time.monotonic()
+    with _vessel_lock:
+        expired = [
+            (message_id, entry)
+            for message_id, entry in _vessel_messages.items()
+            if entry.state == _VESSEL_OPEN
+            and now - entry.touched_at > _VESSEL_MESSAGE_TTL_SEC
+        ]
+    if not expired:
+        return
+    held = {message_id for message_id, _ in expired if _vessel_held_by_addon(message_id)}
+    notices: List[_ClosedNotice] = []
+    with _vessel_lock:
+        now = time.monotonic()
+        for message_id, entry in expired:
+            # 尋ねている間に締め・触り直し・別の見回りが先に済ませていたら何もしない
+            if (entry.state != _VESSEL_OPEN
+                    or now - entry.touched_at <= _VESSEL_MESSAGE_TTL_SEC):
+                continue
+            if message_id in held:
+                _touch_locked(message_id, entry, now)
+                continue
+            notices.append((
+                message_id, entry.pulse_id, len(entry.pieces),
+                "the vessel never finished this message",
+            ))
+            _close_locked(message_id, entry, now)
+    _notify_closed(notices)
+
+
+def _evict_over_capacity_locked(now: float) -> List[_ClosedNotice]:
+    """件数が ``_VESSEL_MESSAGE_MAX`` を超えたら、捨ててよい記録だけを捨てる。
+
+    捨ててよいのは、終わった記録 ("unclaimed" / "closed") のうち
+    ``_VESSEL_RETAIN_TERMINAL_SEC`` (1 日) より長く触られていないものだけ。
+    "open" の記録は件数では捨てない (``_VESSEL_MESSAGE_TTL_SEC`` の期限切れで
+    だけ閉じる)。終わった記録も 1 日は残すので、遅れて来た断片で判定がやり直され
+    たり、閉じた発話が開き直されたりしない (終わった記録は切れ端を持たない
+    小さな記録なので、上限を超えて残っても構わない)。
+    戻り値は互換のため残している (常に空)。``_vessel_lock`` を持った状態で呼ぶ。
+    """
+    if len(_vessel_messages) <= _VESSEL_MESSAGE_MAX:
+        return []
+    for message_id, entry in list(_vessel_messages.items()):
+        if len(_vessel_messages) <= _VESSEL_MESSAGE_MAX:
+            break
+        if (entry.state != _VESSEL_OPEN
+                and now - entry.touched_at > _VESSEL_RETAIN_TERMINAL_SEC):
+            del _vessel_messages[message_id]
+    return []
+
+
+def _run_vessel_sweeper(stop: threading.Event) -> None:
+    """``_VESSEL_SWEEP_INTERVAL_SEC`` ごとに ``_expire_vessel_messages`` を回す。
+
+    "open" の記録が無くなったら ``_vessel_sweeper`` を None に戻して抜ける。
+    ``stop`` が立つか、``_vessel_sweeper`` が別の見回りに替わっていたら抜ける。
+    """
+    global _vessel_sweeper
+    while not stop.wait(_VESSEL_SWEEP_INTERVAL_SEC):
+        with _vessel_lock:
+            if _vessel_sweeper is None or _vessel_sweeper.stop is not stop:
+                return
+        try:
+            _expire_vessel_messages()
+        except Exception:
+            LOGGER.exception("vessel voice sweeper failed to expire messages")
+        with _vessel_lock:
+            if _vessel_sweeper is None or _vessel_sweeper.stop is not stop:
+                return
+            if not any(entry.state == _VESSEL_OPEN for entry in _vessel_messages.values()):
+                _vessel_sweeper = None
+                return
+
+
+def _ensure_vessel_sweeper_locked() -> None:
+    """見回りスレッドが動いていなければ起こす。``_vessel_lock`` を持った状態で呼ぶ。"""
+    global _vessel_sweeper
+    if _vessel_sweeper is not None and _vessel_sweeper.thread.is_alive():
+        return
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=_run_vessel_sweeper, args=(stop,),
+        name="voice-tts-vessel-sweeper", daemon=True,
+    )
+    _vessel_sweeper = _VesselSweeper(thread=thread, stop=stop)
+    thread.start()
+
+
+def _recall_claim(message_id: str, pulse_id: Optional[str]) -> Optional[bool]:
+    """決まっている判定を返す (記録が無ければ None)。記録は触る。"""
+    with _vessel_lock:
+        entry = _vessel_messages.get(message_id)
+        if entry is None:
+            return None
+        _touch_locked(message_id, entry, time.monotonic())
+        if entry.pulse_id is None:
+            entry.pulse_id = pulse_id
+        return entry.state != _VESSEL_UNCLAIMED
+
+
+def claim_message_voice(
+    persona_id: str,
+    building_id: Optional[str],
+    message_id: str,
+    pulse_id: Optional[str] = None,
+) -> bool:
+    """この発話の声を仮想身体が引き受けるかを、message_id ごとに一度だけ決める。
+
+    ``speak_hook.on_persona_speak`` と Godot アドオンが断片ごとに呼ぶ。最初の
+    呼び出しで ``_is_voice_claimed`` を評価して記録を作り (真なら "open"、偽なら
+    "unclaimed")、以降は同じ答えを返す。途中で Vessel が繋がった・切れた場合も、
+    記録が "closed" になった後も変えない。同じ message_id の最初の呼び出しが
+    同時に来ても、判定関数は一回だけ走る (``_vessel_decision_lock``)。
+
+    呼ぶたびに記録を触るので、断片が続いている "open" の発話は期限切れにならない。
+    """
+    _expire_vessel_messages()
+    decided = _recall_claim(message_id, pulse_id)
+    if decided is not None:
+        return decided
+    with _vessel_decision_lock:
+        decided = _recall_claim(message_id, pulse_id)
+        if decided is not None:
+            # 同じ発話の別の断片が、判定の順番待ちの間に先に決めていた
+            return decided
+        claimed = _is_voice_claimed(persona_id, building_id or "")
+        now = time.monotonic()
+        with _vessel_lock:
+            _vessel_messages[message_id] = _VesselMessage(
+                state=_VESSEL_OPEN if claimed else _VESSEL_UNCLAIMED,
+                created_at=now,
+                touched_at=now,
+                pulse_id=pulse_id,
+            )
+            evicted = _evict_over_capacity_locked(now)
+            if claimed:
+                _ensure_vessel_sweeper_locked()
+    if claimed:
+        LOGGER.debug(
+            "voice of msg=%s is claimed by the vessel (persona=%s building=%s)",
+            message_id, persona_id, building_id,
+        )
+    _notify_closed(evicted)
+    return claimed
+
+
+def synthesize_piece(
+    persona_id: str,
+    text: str,
+    *,
+    message_id: str,
+    timeout: float,
+) -> Tuple[bytes, float]:
+    """仮想身体の一切れの文を合成し、``(16-bit PCM の WAV, 秒数)`` を返す。
+
+    合成は既存のワーカースレッドに並べて行う (通常の合成とエンジンを同時に
+    使わない)。声プロファイル・エンジン・話速などの合成パラメータ・読み方の
+    辞書・読み上げ前の整形 (``clean_text_for_tts``) は通常の合成と同じ。
+    再生・画面への通知・ファイル保存はしない。
+
+    message_id の記録が "open" のときだけ、切れ端を依頼順に取っておき、
+    ``finish_message`` で吹き出しの声にする。記録が無い・"unclaimed"・"closed"
+    の発話では声を返すだけで、記録にも吹き出しにも触らない。
+
+    Raises:
+        NothingToVoice: 整形後に読み上げる文字が残らない (記録には触らない)。
+            ワーカーで読み方の辞書を当てて残らなくなったときも送出し、その枠は
+            ``skipped`` に入れて欠けにはしない。
+        VoiceUnavailable: アドオンが無効・このペルソナの ``auto_speak`` が OFF・
+            声プロファイルが無い。依頼の受付時と、ワーカーが合成を始める時の
+            両方で確かめる。
+        TimeoutError: ``timeout`` 秒までに合成が終わらなかった。
+        その他: エンジンの例外をそのまま送出する。
+
+    ``NothingToVoice`` 以外の例外では、"open" の発話は欠けありとして記録され、
+    ``finish_message`` は吹き出しに声を付けない。
+    """
+    _expire_vessel_messages()
+    if not clean_text_for_tts(text).strip():
+        # 整形すると読み上げる文字が残らない区切り (URL だけ等) は、もともと
+        # 声の無い区切り。欠けではないので、吹き出しの声を諦める理由にしない。
+        raise NothingToVoice("no voiceable text in this piece")
+    entry: Optional[_VesselMessage]
+    slot = -1
+    with _vessel_lock:
+        entry = _vessel_messages.get(message_id)
+        if entry is not None and entry.state == _VESSEL_OPEN:
+            slot = len(entry.pieces)
+            entry.pieces.append(None)
+            _touch_locked(message_id, entry, time.monotonic())
+        else:
+            # 知らない・引き受けていない・閉じた発話。声は返すが、記録には加えない
+            entry = None
+    try:
+        params = _get_effective_params(persona_id)
+        if not params.get("_enabled", True):
+            raise VoiceUnavailable("voice-tts addon is disabled")
+        if not params.get("auto_speak", True):
+            raise VoiceUnavailable("auto_speak is off for this persona")
+        future: "Future[Tuple[np.ndarray, int]]" = Future()
+        _worker.start()
+        _worker._queue.put(_PieceJob(
+            persona_id=persona_id, text=text, message_id=message_id, future=future,
+        ))
+        try:
+            audio, sample_rate = future.result(timeout=timeout)
+        except _FutureTimeout:
+            # ワーカーがまだ始めていなければ取り消す。始めていたら合成は最後まで
+            # 走るが、その結果は使わない (切れ端の枠は欠けたまま)。
+            future.cancel()
+            raise TimeoutError(
+                f"voice piece was not synthesized within {timeout:.1f}s"
+            ) from None
+    except NothingToVoice:
+        # ワーカーで読み方の辞書を当てたら読み上げる文字が残らなかった。入口の
+        # NothingToVoice と同じく欠けにはせず、この枠をつなぐ対象から外す
+        if entry is not None:
+            with _vessel_lock:
+                if entry.state == _VESSEL_OPEN:
+                    entry.skipped.add(slot)
+                    _touch_locked(message_id, entry, time.monotonic())
+        raise
+    except Exception:
+        if entry is not None:
+            with _vessel_lock:
+                if entry.state == _VESSEL_OPEN:
+                    entry.broken = True
+                    _touch_locked(message_id, entry, time.monotonic())
+        raise
+    if entry is not None:
+        with _vessel_lock:
+            if entry.state == _VESSEL_OPEN:
+                entry.pieces[slot] = (audio, sample_rate)
+                _touch_locked(message_id, entry, time.monotonic())
+    return _wav_bytes(audio, sample_rate), len(audio) / float(sample_rate)
+
+
+def finish_message(
+    message_id: str,
+    *,
+    complete: bool,
+    pulse_id: Optional[str] = None,
+) -> None:
+    """仮想身体がこの発話の最後の区切りまで配送し終えたことを受け取る。
+
+    記録が "open" のときだけ "closed" にし、吹き出しへ結末を一度だけ知らせる。
+    ``complete`` が真で、切れ端が一つ以上あり、欠けた切れ端が無く、全切れ端の
+    sample_rate が揃っていれば、切れ端を依頼順につないで保存し、吹き出しの
+    「音声を再生」を出す。知らせには ``audio_completed`` を使う (画面の自動再生
+    ``auto_play_tts`` は ``audio_ready`` だけを購読しているので、ブラウザでは
+    鳴らない)。それ以外は ``notify_no_audio`` で「この吹き出しに音声は無い」を
+    知らせる。
+
+    記録が無い・"unclaimed"・"closed" の発話では何も知らせず、記録も変えない
+    (二度目の呼び出しは何もしない)。"unclaimed" は通常の合成が吹き出しを持ち、
+    "closed" は既に結末を知らせ済み。記録が無いのは ``claim_message_voice`` を
+    経ていないか、上限で追い出された発話 (追い出しが "open" の記録だったなら、
+    そのときに ``notify_no_audio`` 済み)。
+    """
+    _expire_vessel_messages()
+    with _vessel_lock:
+        entry = _vessel_messages.get(message_id)
+        state = entry.state if entry is not None else None
+        if entry is not None and state == _VESSEL_OPEN:
+            slots = [piece for index, piece in enumerate(entry.pieces)
+                     if index not in entry.skipped]
+            broken = entry.broken
+            stored_pulse = entry.pulse_id
+            _close_locked(message_id, entry, time.monotonic())
+    if entry is None or state != _VESSEL_OPEN:
+        LOGGER.info(
+            "finish_message: msg=%s is %s; nothing to tell the bubble",
+            message_id, state or "unknown",
+        )
+        return
+    pulse = pulse_id if pulse_id is not None else stored_pulse
+
+    reason: Optional[str] = None
+    pieces: List[Tuple[np.ndarray, int]] = []
+    if not complete:
+        reason = "the vessel did not deliver every piece of this message"
+    elif not slots:
+        reason = "no voice pieces were synthesized for this message"
+    elif broken or any(piece is None for piece in slots):
+        reason = "a voice piece of this message was not synthesized"
+    else:
+        pieces = [piece for piece in slots if piece is not None]
+        if len({sample_rate for _, sample_rate in pieces}) != 1:
+            reason = "voice pieces of this message have different sample rates"
+    if reason is not None:
+        notify_no_audio(message_id, reason, pulse_id=pulse)
+        return
+
+    sample_rate = pieces[0][1]
+    full = np.concatenate([audio for audio, _ in pieces])
+    version = uuid.uuid4().hex
+    try:
+        wav_path = _worker._save_wav(full, sample_rate, version)
+    except Exception as exc:
+        LOGGER.warning("Failed to save vessel voice wav: %s (msg=%s)", exc, message_id)
+        notify_no_audio(message_id, f"failed to save the voice: {exc}", pulse_id=pulse)
+        return
+    LOGGER.debug(
+        "vessel voice wav saved: %s (%d pieces, %d ms, msg=%s)",
+        wav_path, len(pieces), int(len(full) / sample_rate * 1000), message_id,
+    )
+    _notify_audio_ready(
+        message_id, wav_path,
+        event_name="audio_completed",
+        version=version,
+        pulse_id=pulse,
     )

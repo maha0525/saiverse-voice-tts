@@ -347,6 +347,7 @@ v0.4.0 以降は本体側の **`server_hooks`** 機構経由で `persona_speak` 
 拡張パック: speak_hook.on_persona_speak
    │
    ├─ get_effective_params(persona_id) で auto_speak チェック
+   ├─ claim_message_voice(...) が真なら何もせず戻る  ← 仮想身体が声を引き受けた発話
    ├─ clean_text_for_tts(text_for_voice)
    └─ enqueue_tts(cleaned, persona_id, message_id)  ← 既存の TTS Worker キューへ
 ```
@@ -367,6 +368,59 @@ v0.4.0 以降は本体側の **`server_hooks`** 機構経由で `persona_speak` 
 本体は本パックが有効化されている時のみハンドラを register し、無効化トグルで
 unregister する。ハンドラが例外を投げても本体側で隔離されるため、発話処理本体
 が止まることはない。
+
+### 仮想身体 (Godot Vessel アドオン) への声の受け渡し
+
+ペルソナが仮想身体の部屋にいて Godot の Vessel が接続中の間、声は VR の
+アバターからだけ鳴らす (SAIVerse 本体 `docs/intent/virtual_embodiment_godot.md`
+の「声は voice-tts から一切れずつ受け取る」)。他のアドオンは
+`sys.modules.get("tools._loaded.speak.playback_worker")` でこの API に届く。
+
+- `register_voice_claim(fn, holds=None)` / `unregister_voice_claim(fn)`: Godot アドオンが
+  `fn(persona_id, building_id) -> bool` を登録する。`holds(message_id) -> bool` は
+  「このアドオンはこの発話をまだ順番待ちか処理中で持っていて、いずれ `finish_message`
+  を呼ぶ」に答える (`unregister_voice_claim` で `fn` と一緒に外れる)。
+  `speak_hook` と Godot アドオンは断片ごとに `claim_message_voice` を呼ぶ。
+  判定は message_id ごとの最初の一回で
+  決まり (同時に来ても `fn` は一回だけ走る)、真ならその発話を通常の合成キューへ
+  入れない (締めの合図も含めて、判定は発話の途中で変えない)。
+- `synthesize_piece(persona_id, text, *, message_id, timeout)`: Godot アドオンが
+  全身エモート記法で区切った一切れを、既存のワーカースレッドで非ストリーミング
+  合成し `(WAV バイト列, 秒数)` を返す。声プロファイル・合成パラメータ・読み方の
+  辞書・`clean_text_for_tts` は `_process` と同じ (`_prepare_synthesis` を共有)。
+  アドオン無効・`auto_speak` OFF・声プロファイル無しは `VoiceUnavailable` (無効化と
+  `auto_speak` は、ワーカーが実際に合成を始める時点でも確かめ直す)、時間切れは
+  `TimeoutError`。整形か読み方の辞書で読み上げる文字が残らない区切りは `NothingToVoice`
+  で、欠けにはせず、その切れ端を飛ばしてつなぐ。再生・audio_stream・通知・保存はしない。
+- `finish_message(message_id, *, complete, pulse_id=None)`: 切れ端を依頼順につないで
+  保存し、`audio_completed` (画面の自動再生が購読しない) で吹き出しに声を付ける。
+  欠けた切れ端があるか `complete=False` なら `notify_no_audio`。
+
+message_id ごとの記録は `_vessel_messages` 一つにだけ持ち、`state` が次のように移る。
+記録を作るのは `claim_message_voice` だけ。
+
+| state | 意味 | `synthesize_piece` | `finish_message` |
+|---|---|---|---|
+| (記録なし) | 判定前、または終わってから 1 日たって捨てられた | 声を返すだけ | 何もしない |
+| `unclaimed` | 判定が偽。通常の合成が吹き出しを持つ | 声を返すだけ | 何もしない |
+| `open` | 判定が真。吹き出しの結末はこちらが持つ | 切れ端を依頼順に取っておく | `closed` にして結末を一度だけ知らせる |
+| `closed` | 締めか期限切れで閉じた | 声を返すだけ | 何もしない |
+
+- `open` のまま 1 時間 (`_VESSEL_MESSAGE_TTL_SEC`) 触られない発話は、登録された `holds`
+  のどれかが真を返せば閉じずに触り直し (アドオン自身の合成待ちが長い発話を閉じない)、
+  そうでなければ `closed` にして `notify_no_audio` する。`holds` の例外は偽として扱う。
+  なのでこの期限は、答えなくなったアドオン (プロセスが落ちた・アドオンが外れた) の
+  最後の網でしかない (画面の待ち表示はフロントが 300 秒で消す)。API が呼ばれなくても
+  効くよう、`open` の記録がある間だけ見回りスレッド (`_run_vessel_sweeper`、
+  30 秒ごと) が動く。
+- 件数が 4096 件 (`_VESSEL_MESSAGE_MAX`) を超えたら、終わってから 1 日
+  (`_VESSEL_RETAIN_TERMINAL_SEC`) 以上たった `unclaimed` / `closed` だけを捨てる。
+  `open` は件数では捨てない (期限切れでだけ閉じる)。終わった記録は切れ端を持たない
+  小さな記録なので、目安を超えて残ってもよい。1 日残すのは、遅れて来た断片で判定が
+  やり直されたり、閉じた発話が開き直されたりしないため。
+- speak_hook は auto_speak の確認より先に `claim_message_voice` を呼ぶ。引き受けた発話
+  では自動発話 OFF の「音声なし」を出さず、結末は `finish_message` か期限切れが一度だけ
+  知らせる (二つのフックの実行順に依らない)。
 
 ### 旧 Playbook 上書き方式 (v0.3.x まで)
 
