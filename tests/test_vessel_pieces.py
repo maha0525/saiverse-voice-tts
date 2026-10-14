@@ -132,6 +132,7 @@ class _VesselTestBase(unittest.TestCase):
             pw._voice_claims.clear()
             pw._vessel_messages.clear()
             pw._claim_decisions.clear()
+            pw._finished_messages.clear()
 
     def event_names(self) -> List[str]:
         return [event["event"] for event in self.events]
@@ -329,6 +330,15 @@ class FinishMessageTests(_VesselTestBase):
         self.assertEqual(frames[0], int(0.25 * 32767))   # 一つ目が先
         self.assertEqual(frames[-1], int(0.5 * 32767))   # 二つ目が後
         self.assertNotIn("msg-1", pw._vessel_messages)
+
+    def test_a_piece_arriving_after_finish_does_not_reopen_the_message(self):
+        self.claim()
+        pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
+        pw.finish_message("msg-1", complete=True)
+        wav, _ = pw.synthesize_piece("p1", "二つ目", message_id="msg-1", timeout=5)
+        self.assertTrue(wav.startswith(b"RIFF"))
+        self.assertNotIn("msg-1", pw._vessel_messages)
+        self.assertEqual(self.event_names(), ["audio_completed"])
 
     def test_a_piece_with_nothing_to_voice_does_not_cost_the_bubble_voice(self):
         self.claim()

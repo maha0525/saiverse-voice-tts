@@ -1276,6 +1276,10 @@ _vessel_lock = threading.Lock()
 _voice_claims: List[Callable[[str, str], bool]] = []
 _vessel_messages: "OrderedDict[str, _VesselMessage]" = OrderedDict()
 _claim_decisions: "OrderedDict[str, bool]" = OrderedDict()
+# finish_message を受け取り終えた message_id。その後に遅れて来た切れ端で
+# 記録を作り直さない (作り直すと、期限切れで声の付いた吹き出しへ二度目の
+# notify_no_audio が飛ぶ)。上限は _CLAIM_DECISION_MAX。
+_finished_messages: "OrderedDict[str, None]" = OrderedDict()
 
 
 def _mono_float32(audio: Any) -> np.ndarray:
@@ -1457,7 +1461,11 @@ def synthesize_piece(
         # 声の無い区切り。欠けではないので、吹き出しの声を諦める理由にしない。
         raise NothingToVoice("no voiceable text in this piece")
     with _vessel_lock:
-        entry = _touch_vessel_message_locked(message_id)
+        if message_id in _finished_messages:
+            # 締めの後に遅れて来た切れ端。声は返すが、吹き出しの声には加えない
+            entry = _VesselMessage(touched_at=time.monotonic())
+        else:
+            entry = _touch_vessel_message_locked(message_id)
         slot = len(entry.pieces)
         entry.pieces.append(None)
     try:
@@ -1514,6 +1522,10 @@ def finish_message(
     with _vessel_lock:
         entry = _vessel_messages.pop(message_id, None)
         owns = _owns_bubble_locked(message_id)
+        _finished_messages[message_id] = None
+        _finished_messages.move_to_end(message_id)
+        while len(_finished_messages) > _CLAIM_DECISION_MAX:
+            _finished_messages.popitem(last=False)
     if not owns:
         LOGGER.info(
             "finish_message: msg=%s was not claimed by the vessel; "
