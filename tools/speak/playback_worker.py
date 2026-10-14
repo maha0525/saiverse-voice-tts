@@ -20,7 +20,7 @@ from concurrent.futures import Future
 from concurrent.futures import TimeoutError as _FutureTimeout
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -400,7 +400,8 @@ class VoiceUnavailable(Exception):
 
 
 class NothingToVoice(VoiceUnavailable):
-    """``synthesize_piece`` に渡した区切りが、整形すると読み上げる文字を残さない。
+    """``synthesize_piece`` に渡した区切りが、整形 (``clean_text_for_tts``) か
+    読み方の辞書 (``_apply_pronunciation``) を当てると読み上げる文字を残さない。
 
     もともと声の無い区切りなので、その発話の欠けとしては数えない
     (吹き出しの声は他の切れ端だけで付く)。
@@ -982,7 +983,9 @@ class _TTSWorker:
             cleaned = clean_text_for_tts(job.text)
             tts_text = self._apply_pronunciation(cleaned, setup.profile, job.persona_id)
             if not tts_text.strip():
-                raise VoiceUnavailable("no voiceable text in this piece")
+                # 読み方の辞書で消える区切りも、synthesize_piece の入口の
+                # NothingToVoice と同じく、もともと声の無い区切りとして扱う
+                raise NothingToVoice("no voiceable text in this piece")
             result = setup.engine.synthesize(
                 text=tts_text,
                 ref_audio=setup.ref_audio,
@@ -995,6 +998,13 @@ class _TTSWorker:
             sample_rate = int(result.sample_rate)
             if sample_rate <= 0:
                 raise RuntimeError("synthesis returned an invalid sample rate")
+        except NothingToVoice as exc:
+            LOGGER.debug(
+                "voice piece has nothing to voice after the pronunciation dict "
+                "(persona=%s msg=%s)", job.persona_id, job.message_id,
+            )
+            job.future.set_exception(exc)
+            return
         except Exception as exc:
             LOGGER.warning(
                 "voice piece synthesis failed (persona=%s msg=%s): %s",
@@ -1273,11 +1283,13 @@ def enqueue_tts(
 
 #: "open" の発話を、触られない (断片・切れ端・締めのどれも来ない) まま持ち続ける
 #: 上限秒数。過ぎたら "closed" にし、``notify_no_audio`` を出す。
-#: これは仮想身体のアドオンが締めを送れなくなった (途中で無効化された・落ちた)
-#: ときの最後の網で、アドオンは受け付けた発話を必ず ``finish_message`` で締める。
-#: アドオンの順番待ちが混んで、受け付け済みの発話が長く待つ回を誤って閉じない
-#: よう長めに取る (画面の待ち表示はフロントが 300 秒で自分から消すので、
-#: 長くしても待ち表示が残り続けることはない)。
+#: ただし ``register_voice_claim`` の ``holds(message_id)`` のどれかが真を返す
+#: 発話 (アドオンがまだ順番待ちか処理中で、いずれ ``finish_message`` を呼ぶ) は
+#: 閉じずに触り直す。アドオン自身の合成待ちが長くても、締めを待ち続けられる。
+#: なのでこの期限は、答えなくなったアドオン (プロセスが落ちた・アドオンが外れた、
+#: または ``holds`` を登録していない) のための最後の網でしかない。
+#: 画面の待ち表示はフロントが 300 秒で自分から消すので、長くしても待ち表示が
+#: 残り続けることはない。
 _VESSEL_MESSAGE_TTL_SEC = 3600.0
 #: 期限切れを見回るスレッド (``_run_vessel_sweeper``) の起床間隔 (秒)。
 _VESSEL_SWEEP_INTERVAL_SEC = 30.0
@@ -1300,14 +1312,17 @@ class _VesselMessage:
     ``state`` は ``_VESSEL_UNCLAIMED`` / ``_VESSEL_OPEN`` / ``_VESSEL_CLOSED``
     (この節の冒頭の図を参照)。``pieces`` の各要素は依頼順の枠で、合成が成功
     したら ``(mono float32 の音声, sample_rate)`` が入る。失敗・時間切れの枠は
-    ``None`` のまま残り、``broken`` が立つ。"closed" になったら ``pieces`` は
-    空にする (音声を持ち続けない)。
+    ``None`` のまま残り、``broken`` が立つ。ワーカーが ``NothingToVoice`` を
+    返した枠 (読み方の辞書を当てると読み上げる文字が残らない) は ``skipped`` に
+    番号を入れ、``finish_message`` はその枠を除いてつなぐ。"closed" になったら
+    ``pieces`` は空にする (音声を持ち続けない)。
     """
     state: str
     created_at: float
     touched_at: float
     pulse_id: Optional[str] = None
     pieces: List[Optional[Tuple[np.ndarray, int]]] = field(default_factory=list)
+    skipped: Set[int] = field(default_factory=set)
     broken: bool = False
 
 
@@ -1319,14 +1334,15 @@ class _VesselSweeper:
 
 
 # _voice_claims・_vessel_messages・_vessel_sweeper を守る。判定関数
-# (_is_voice_claimed) と吹き出しへの知らせ (notify_no_audio /
-# _notify_audio_ready) は、このロックを持ったまま呼ばない。
+# (_is_voice_claimed)・``holds`` (_vessel_held_by_addon) と吹き出しへの知らせ
+# (notify_no_audio / _notify_audio_ready) は、このロックを持ったまま呼ばない。
 _vessel_lock = threading.Lock()
 # claim_message_voice の判定を一件ずつ順に行う。同じ message_id の最初の断片が
 # 同時に来ても、判定関数は一回だけ走る。取る順は _vessel_decision_lock →
 # _vessel_lock で、逆順には取らない。
 _vessel_decision_lock = threading.Lock()
-_voice_claims: List[Callable[[str, str], bool]] = []
+# 登録された (判定関数, holds) の組。holds は登録されていなければ None。
+_voice_claims: List[Tuple[Callable[[str, str], bool], Optional[Callable[[str], bool]]]] = []
 # 並びは触った順 (先頭が最も古い)。上限超過時は先頭から捨てる。
 _vessel_messages: "OrderedDict[str, _VesselMessage]" = OrderedDict()
 # 動いている見回りスレッド。"open" の記録が無くなると自分で抜けて None に戻し、
@@ -1362,22 +1378,34 @@ def _wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     return out.getvalue()
 
 
-def register_voice_claim(fn: Callable[[str, str], bool]) -> None:
+def register_voice_claim(
+    fn: Callable[[str, str], bool],
+    holds: Optional[Callable[[str], bool]] = None,
+) -> None:
     """発話の声を仮想身体が引き受けるかの判定関数を登録する。
 
     ``fn(persona_id, building_id)`` が真を返した発話は、voice-tts の通常の
-    合成 (ブラウザ・サーバーのスピーカー) に流さない。同じ関数オブジェクトの
-    二度目の登録は何もしない。
+    合成 (ブラウザ・サーバーのスピーカー) に流さない。
+
+    ``holds(message_id)`` は「このアドオンはこの発話をまだ順番待ちか処理中で
+    持っていて、いずれ ``finish_message`` を呼ぶ」に答える。真を返す発話は
+    ``_VESSEL_MESSAGE_TTL_SEC`` を過ぎても期限切れで閉じない
+    (``_expire_vessel_messages``)。
+
+    同じ関数オブジェクトの二度目の登録は何もしない (``holds`` も差し替えない)。
     """
     with _vessel_lock:
-        if not any(existing is fn for existing in _voice_claims):
-            _voice_claims.append(fn)
+        if not any(existing is fn for existing, _ in _voice_claims):
+            _voice_claims.append((fn, holds))
 
 
 def unregister_voice_claim(fn: Callable[[str, str], bool]) -> None:
-    """``register_voice_claim`` で登録した判定関数を外す (未登録なら何もしない)。"""
+    """``register_voice_claim`` で登録した判定関数を、その ``holds`` ごと外す。
+
+    未登録なら何もしない。
+    """
     with _vessel_lock:
-        _voice_claims[:] = [existing for existing in _voice_claims if existing is not fn]
+        _voice_claims[:] = [pair for pair in _voice_claims if pair[0] is not fn]
 
 
 def _is_voice_claimed(persona_id: str, building_id: str) -> bool:
@@ -1386,7 +1414,7 @@ def _is_voice_claimed(persona_id: str, building_id: str) -> bool:
     判定関数は他のアドオンのコードなので、``_vessel_lock`` を持たずに呼ぶ。
     """
     with _vessel_lock:
-        claims = list(_voice_claims)
+        claims = [fn for fn, _ in _voice_claims]
     for fn in claims:
         try:
             if fn(persona_id, building_id):
@@ -1430,24 +1458,57 @@ def _notify_closed(notices: List[_ClosedNotice]) -> None:
         notify_no_audio(message_id, reason, pulse_id=pulse_id)
 
 
+def _vessel_held_by_addon(message_id: str) -> bool:
+    """登録された ``holds`` のどれかがこの発話を持っていると答えれば真。
+
+    例外は記録して偽として扱う。``holds`` は他のアドオンのコードなので、
+    ``_vessel_lock`` を持たずに呼ぶ。
+    """
+    with _vessel_lock:
+        holders = [holds for _, holds in _voice_claims if holds is not None]
+    for holds in holders:
+        try:
+            if holds(message_id):
+                return True
+        except Exception:
+            LOGGER.exception("vessel holds check failed (msg=%s)", message_id)
+    return False
+
+
 def _expire_vessel_messages() -> None:
     """触られないまま ``_VESSEL_MESSAGE_TTL_SEC`` を過ぎた "open" の発話を閉じる。
 
-    閉じた発話の吹き出しには ``notify_no_audio`` で待ち表示を解かせる。
-    見回りスレッド (``_run_vessel_sweeper``) と各 API の入口から呼ばれる。
+    閉じる前に ``_vessel_held_by_addon`` に尋ね、アドオンがまだ持っている発話は
+    閉じずに触り直す。閉じた発話の吹き出しには ``notify_no_audio`` で待ち表示を
+    解かせる。見回りスレッド (``_run_vessel_sweeper``) と各 API の入口から呼ばれる。
     """
     now = time.monotonic()
+    with _vessel_lock:
+        expired = [
+            (message_id, entry)
+            for message_id, entry in _vessel_messages.items()
+            if entry.state == _VESSEL_OPEN
+            and now - entry.touched_at > _VESSEL_MESSAGE_TTL_SEC
+        ]
+    if not expired:
+        return
+    held = {message_id for message_id, _ in expired if _vessel_held_by_addon(message_id)}
     notices: List[_ClosedNotice] = []
     with _vessel_lock:
-        for message_id, entry in list(_vessel_messages.items()):
-            if entry.state != _VESSEL_OPEN:
+        now = time.monotonic()
+        for message_id, entry in expired:
+            # 尋ねている間に締め・触り直し・別の見回りが先に済ませていたら何もしない
+            if (entry.state != _VESSEL_OPEN
+                    or now - entry.touched_at <= _VESSEL_MESSAGE_TTL_SEC):
                 continue
-            if now - entry.touched_at > _VESSEL_MESSAGE_TTL_SEC:
-                notices.append((
-                    message_id, entry.pulse_id, len(entry.pieces),
-                    "the vessel never finished this message",
-                ))
-                _close_locked(message_id, entry, now)
+            if message_id in held:
+                _touch_locked(message_id, entry, now)
+                continue
+            notices.append((
+                message_id, entry.pulse_id, len(entry.pieces),
+                "the vessel never finished this message",
+            ))
+            _close_locked(message_id, entry, now)
     _notify_closed(notices)
 
 
@@ -1588,6 +1649,8 @@ def synthesize_piece(
 
     Raises:
         NothingToVoice: 整形後に読み上げる文字が残らない (記録には触らない)。
+            ワーカーで読み方の辞書を当てて残らなくなったときも送出し、その枠は
+            ``skipped`` に入れて欠けにはしない。
         VoiceUnavailable: アドオンが無効・このペルソナの ``auto_speak`` が OFF・
             声プロファイルが無い。依頼の受付時と、ワーカーが合成を始める時の
             両方で確かめる。
@@ -1633,6 +1696,15 @@ def synthesize_piece(
             raise TimeoutError(
                 f"voice piece was not synthesized within {timeout:.1f}s"
             ) from None
+    except NothingToVoice:
+        # ワーカーで読み方の辞書を当てたら読み上げる文字が残らなかった。入口の
+        # NothingToVoice と同じく欠けにはせず、この枠をつなぐ対象から外す
+        if entry is not None:
+            with _vessel_lock:
+                if entry.state == _VESSEL_OPEN:
+                    entry.skipped.add(slot)
+                    _touch_locked(message_id, entry, time.monotonic())
+        raise
     except Exception:
         if entry is not None:
             with _vessel_lock:
@@ -1675,7 +1747,8 @@ def finish_message(
         entry = _vessel_messages.get(message_id)
         state = entry.state if entry is not None else None
         if entry is not None and state == _VESSEL_OPEN:
-            slots = entry.pieces
+            slots = [piece for index, piece in enumerate(entry.pieces)
+                     if index not in entry.skipped]
             broken = entry.broken
             stored_pulse = entry.pulse_id
             _close_locked(message_id, entry, time.monotonic())

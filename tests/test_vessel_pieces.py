@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import importlib
 import io
 import sys
 import tempfile
@@ -38,11 +39,21 @@ if str(_PACK_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACK_ROOT))
 
 from tools.speak import playback_worker as pw  # noqa: E402
-from tools.speak import pronunciation_dict  # noqa: E402
+from tools.speak import pronunciation_dict  # noqa: E402,F401
 from tools.speak import text_cleaner as _text_cleaner  # noqa: E402
 from tools.speak.engine.base import SynthesisResult, TTSEngine  # noqa: E402
 
 SAMPLE_RATE = 24000
+
+
+def _live_pronunciation_dict():
+    """``_apply_pronunciation`` が呼ぶ時点の pronunciation_dict。
+
+    他のテストが ``tools.speak`` を読み込み直すと、このファイルが import した
+    モジュールと ``from . import pronunciation_dict`` が解決するモジュールが
+    別物になるので、差し替えは呼ぶ時点のものに当てる。
+    """
+    return importlib.import_module(pw.__package__ + ".pronunciation_dict")
 _AMPLITUDE = {"一つ目": 0.25, "二つ目": 0.5}
 
 
@@ -127,7 +138,7 @@ class _VesselTestBase(unittest.TestCase):
             "engine": "gpt_sovits", "ref_audio": None, "ref_text": None, "params": {},
         }))
         self.stack.enter_context(
-            patch.object(pronunciation_dict, "apply", side_effect=lambda t, **k: t))
+            patch.object(_live_pronunciation_dict(), "apply", side_effect=lambda t, **k: t))
         self.stack.enter_context(patch.object(self.worker, "_get_engine", return_value=self.engine))
 
         self._reset_vessel_state()
@@ -259,7 +270,7 @@ class ClaimRegistryTests(_VesselTestBase):
 
         pw.register_voice_claim(claim)
         pw.register_voice_claim(claim)
-        self.assertEqual(pw._voice_claims, [claim])
+        self.assertEqual(pw._voice_claims, [(claim, None)])
         self.assertTrue(pw._is_voice_claimed("p1", "room"))
         pw.unregister_voice_claim(claim)
         pw.unregister_voice_claim(claim)
@@ -273,6 +284,21 @@ class ClaimRegistryTests(_VesselTestBase):
         pw.register_voice_claim(broken)
         with self.assertLogs(pw.LOGGER, level="ERROR"):
             self.assertFalse(pw._is_voice_claimed("p1", "room"))
+
+    def test_registering_with_holds_twice_stays_one_entry(self):
+        def claim(_persona: str, _building: str) -> bool:
+            return True
+
+        def holds(_message_id: str) -> bool:
+            return True
+
+        pw.register_voice_claim(claim, holds)
+        pw.register_voice_claim(claim, holds)
+        self.assertEqual(pw._voice_claims, [(claim, holds)])
+        self.assertTrue(pw._vessel_held_by_addon("msg-1"))
+        pw.unregister_voice_claim(claim)
+        self.assertEqual(pw._voice_claims, [])
+        self.assertFalse(pw._vessel_held_by_addon("msg-1"))
 
 
 class SynthesizePieceTests(_VesselTestBase):
@@ -455,6 +481,27 @@ class FinishMessageTests(_VesselTestBase):
         pw.finish_message("msg-1", complete=True)
         self.assertEqual(self.event_names(), ["audio_completed"])
 
+    def test_a_piece_silenced_by_the_pronunciation_dict_is_left_out_of_the_voice(self):
+        """読み方の辞書で読み上げる文字が消える切れ端も、欠けにせず飛ばしてつなぐ。"""
+        self.stack.enter_context(patch.object(
+            _live_pronunciation_dict(), "apply",
+            side_effect=lambda t, **k: "" if t == "消える" else t))
+        self.claim()
+        pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
+        with self.assertRaises(pw.NothingToVoice):
+            pw.synthesize_piece("p1", "消える", message_id="msg-1", timeout=5)
+        pw.synthesize_piece("p1", "二つ目", message_id="msg-1", timeout=5)
+        pw.finish_message("msg-1", complete=True)
+
+        self.assertEqual(self.engine.texts, ["一つ目", "二つ目"])
+        self.assertEqual(self.event_names(), ["audio_completed"])
+        meta = {row["key"]: row["value"] for row in self.metadata}
+        with wave.open(str(meta["audio_file"]), "rb") as wf:
+            frames = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+        self.assertEqual(len(frames), 2 * 3 * 120)
+        self.assertEqual(frames[0], int(0.25 * 32767))   # 一つ目
+        self.assertEqual(frames[-1], int(0.5 * 32767))   # 二つ目
+
     def test_incomplete_or_broken_message_gets_no_voice(self):
         self.claim("msg-1")
         pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
@@ -614,6 +661,48 @@ class ExpiryTests(_VesselTestBase):
         pw.finish_message("msg-1", complete=True)
         self.assertEqual(self.event_names(), ["audio_unavailable"])
         self.assertEqual(list(Path(self.tmp.name).glob("*.wav")), [])
+
+    def test_a_message_the_addon_still_holds_survives_the_ttl_until_finished(self):
+        held = {"msg-1"}
+        pw.register_voice_claim(_always_claim, lambda message_id: message_id in held)
+        self.assertTrue(pw.claim_message_voice("p1", "room", "msg-1", pulse_id="pulse-1"))
+        pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
+        for _ in range(5):
+            self.age("msg-1")
+            pw._expire_vessel_messages()
+        self.assertEqual(self.state_of("msg-1"), "open")
+        self.assertEqual(self.events, [])
+
+        pw.synthesize_piece("p1", "二つ目", message_id="msg-1", timeout=5)
+        pw.finish_message("msg-1", complete=True)
+        self.assertEqual(self.event_names(), ["audio_completed"])
+
+    def test_once_holds_answers_false_the_message_expires_once(self):
+        held = {"msg-1"}
+        pw.register_voice_claim(_always_claim, lambda message_id: message_id in held)
+        self.assertTrue(pw.claim_message_voice("p1", "room", "msg-1"))
+        self.age("msg-1")
+        pw._expire_vessel_messages()
+        self.assertEqual(self.state_of("msg-1"), "open")
+
+        held.clear()
+        self.age("msg-1")
+        pw._expire_vessel_messages()
+        pw._expire_vessel_messages()
+        self.assertEqual(self.state_of("msg-1"), "closed")
+        self.assertEqual(self.event_names(), ["audio_unavailable"])
+
+    def test_a_failing_holds_counts_as_false(self):
+        def broken(_message_id: str) -> bool:
+            raise RuntimeError("boom")
+
+        pw.register_voice_claim(_always_claim, broken)
+        self.assertTrue(pw.claim_message_voice("p1", "room", "msg-1"))
+        self.age("msg-1")
+        with self.assertLogs(pw.LOGGER, level="ERROR"):
+            pw._expire_vessel_messages()
+        self.assertEqual(self.state_of("msg-1"), "closed")
+        self.assertEqual(self.event_names(), ["audio_unavailable"])
 
     def test_open_messages_are_never_pushed_out_by_the_bound(self):
         pw.register_voice_claim(lambda _p, _b: True)
