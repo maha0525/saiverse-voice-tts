@@ -12,6 +12,9 @@
 - ``finish_message`` は切れ端を依頼順につないで保存し、自動再生されない
   ``audio_completed`` で吹き出しに声を付ける。一切れでも欠けたら
   ``notify_no_audio``。
+- message_id ごとの記録は ``claim_message_voice`` だけが作り、state が
+  "unclaimed" / "open" / "closed" と移る。吹き出しへの結末の知らせは
+  "open" から "closed" へ移る一回だけ (締め・期限切れ・上限での追い出し)。
 """
 from __future__ import annotations
 
@@ -69,6 +72,10 @@ class _TextEngine(TTSEngine):
         audio = np.full(len(text) * 120, _AMPLITUDE.get(text, 0.1), dtype=np.float32)
         return SynthesisResult(audio=audio, sample_rate=SAMPLE_RATE,
                                duration_ms=int(len(audio) / SAMPLE_RATE * 1000))
+
+
+def _always_claim(_persona: str, _building: str) -> bool:
+    return True
 
 
 class _VesselTestBase(unittest.TestCase):
@@ -131,8 +138,34 @@ class _VesselTestBase(unittest.TestCase):
         with pw._vessel_lock:
             pw._voice_claims.clear()
             pw._vessel_messages.clear()
-            pw._claim_decisions.clear()
-            pw._finished_messages.clear()
+            sweeper, pw._vessel_sweeper = pw._vessel_sweeper, None
+        if sweeper is not None:
+            sweeper.stop.set()
+            sweeper.thread.join(5)
+
+    def state_of(self, message_id: str) -> Optional[str]:
+        with pw._vessel_lock:
+            entry = pw._vessel_messages.get(message_id)
+            return entry.state if entry is not None else None
+
+    def age(self, *message_ids: str) -> None:
+        """記録を ``_VESSEL_MESSAGE_TTL_SEC`` より前に触られたことにする。"""
+        with pw._vessel_lock:
+            for message_id in message_ids:
+                pw._vessel_messages[message_id].touched_at -= pw._VESSEL_MESSAGE_TTL_SEC + 1
+
+    def claim(self, message_id: str = "msg-1") -> None:
+        """Godot アドオンと同じく、切れ端の前に ``claim_message_voice`` で引き受ける。"""
+        pw.register_voice_claim(_always_claim)
+        self.assertTrue(pw.claim_message_voice("p1", "room", message_id, pulse_id="pulse-1"))
+
+    def wait_until(self, predicate, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return predicate()
 
     def event_names(self) -> List[str]:
         return [event["event"] for event in self.events]
@@ -155,7 +188,7 @@ class SpeakHookClaimTests(_VesselTestBase):
             self.claim_calls.append((persona_id, building_id))
             return self.claimed
 
-        self.claim = claim
+        self.claim_fn = claim
         pw.register_voice_claim(claim)
 
     def speak(self, text: str, message_id: str = "msg-1", **kwargs: Any) -> None:
@@ -173,7 +206,7 @@ class SpeakHookClaimTests(_VesselTestBase):
         self.assertEqual(self.claim_calls, [("p1", "room")])
         # 吹き出しの結末は finish_message が持つ。ここでは何も知らせない
         self.assertEqual(self.metadata, [])
-        self.assertIn("msg-1", pw._vessel_messages)
+        self.assertEqual(self.state_of("msg-1"), "open")
 
         # 別の発話は改めて判定される
         self.speak("別の発話。", message_id="msg-2")
@@ -187,10 +220,10 @@ class SpeakHookClaimTests(_VesselTestBase):
             "こんにちは", "p1", message_id="msg-1", pulse_id="pulse-1",
             sub_seq=1, is_final=False,
         )
-        self.assertNotIn("msg-1", pw._vessel_messages)
+        self.assertEqual(self.state_of("msg-1"), "unclaimed")
 
     def test_without_any_claim_function_nothing_changes(self):
-        pw.unregister_voice_claim(self.claim)
+        pw.unregister_voice_claim(self.claim_fn)
         self.speak("こんにちは")
         self.enqueue.assert_called_once()
 
@@ -246,6 +279,7 @@ class SynthesizePieceTests(_VesselTestBase):
         self.assertEqual(list(Path(self.tmp.name).glob("*.wav")), [])
 
     def test_auto_speak_off_or_disabled_addon_makes_no_voice(self):
+        self.claim("msg-off")
         for change in ({"auto_speak": False}, {"_enabled": False}):
             with self.subTest(change=change):
                 saved = dict(self.params)
@@ -264,6 +298,7 @@ class SynthesizePieceTests(_VesselTestBase):
                 pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
 
     def test_timeout_raises_and_breaks_the_message(self):
+        self.claim()
         self.engine.gate = threading.Event()
         self.addCleanup(self.engine.gate.set)
         with self.assertRaises(TimeoutError):
@@ -272,9 +307,7 @@ class SynthesizePieceTests(_VesselTestBase):
         with self.assertRaises(TimeoutError):
             pw.synthesize_piece("p1", "二つ目", message_id="msg-1", timeout=0.05)
         self.engine.gate.set()
-        deadline = time.monotonic() + 5
-        while self.worker._queue.unfinished_tasks and time.monotonic() < deadline:
-            time.sleep(0.01)
+        self.assertTrue(self.wait_until(lambda: not self.worker._queue.unfinished_tasks))
         self.assertEqual(self.engine.texts, ["一つ目"])
         self.assertTrue(pw._vessel_messages["msg-1"].broken)
 
@@ -304,12 +337,49 @@ class SynthesizePieceTests(_VesselTestBase):
         self.assertEqual(set(self.engine.threads), {"voice-tts-worker"})
         self.assertIn("value", result)
 
+    def test_a_queued_piece_is_not_synthesized_after_auto_speak_is_turned_off(self):
+        """受付の後、合成を始める前に auto_speak が切られた切れ端は合成しない。"""
+        self.claim()
+        self.engine.gate = threading.Event()
+        self.addCleanup(self.engine.gate.set)
+        self.params["streaming"] = False
+        self.worker.enqueue("通常の発話", "p1", message_id="msg-normal")
+        self.assertTrue(self.engine.entered.wait(5))
+        result: Dict[str, Any] = {}
+
+        def piece() -> None:
+            try:
+                pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
+            except Exception as exc:  # noqa: BLE001 - 送出された例外を確かめる
+                result["error"] = exc
+
+        thread = threading.Thread(target=piece)
+        thread.start()
+        # 切れ端がワーカーの待ち行列に並ぶまで待ってから切る
+        self.assertTrue(self.wait_until(lambda: self.worker._queue.qsize() >= 1))
+        self.params["auto_speak"] = False
+        self.engine.gate.set()
+        thread.join(5)
+
+        self.assertIsInstance(result.get("error"), pw.VoiceUnavailable)
+        self.assertEqual(self.engine.texts, ["通常の発話"])
+        pw.finish_message("msg-1", complete=True)
+        self.assertEqual(
+            [e["event"] for e in self.events if e["message_id"] == "msg-1"],
+            ["audio_unavailable"],
+        )
+
+    def test_a_piece_of_an_unclaimed_or_unknown_message_is_not_kept(self):
+        pw.register_voice_claim(lambda _p, _b: False)
+        self.assertFalse(pw.claim_message_voice("p1", "room", "msg-normal"))
+        for message_id in ("msg-normal", "msg-unknown"):
+            wav, _ = pw.synthesize_piece("p1", "一つ目", message_id=message_id, timeout=5)
+            self.assertTrue(wav.startswith(b"RIFF"))
+        self.assertEqual(pw._vessel_messages["msg-normal"].pieces, [])
+        self.assertNotIn("msg-unknown", pw._vessel_messages)
+
 
 class FinishMessageTests(_VesselTestBase):
-    def claim(self, message_id: str = "msg-1") -> None:
-        pw.register_voice_claim(lambda _p, _b: True)
-        self.assertTrue(pw.claim_message_voice("p1", "room", message_id, pulse_id="pulse-1"))
-
     def test_complete_message_gets_the_joined_voice_without_auto_play(self):
         self.claim()
         pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
@@ -329,7 +399,22 @@ class FinishMessageTests(_VesselTestBase):
         self.assertEqual(len(frames), 2 * 3 * 120)
         self.assertEqual(frames[0], int(0.25 * 32767))   # 一つ目が先
         self.assertEqual(frames[-1], int(0.5 * 32767))   # 二つ目が後
-        self.assertNotIn("msg-1", pw._vessel_messages)
+        self.assertEqual(self.state_of("msg-1"), "closed")
+        self.assertEqual(pw._vessel_messages["msg-1"].pieces, [])
+
+    def test_a_repeated_finish_tells_the_bubble_only_once(self):
+        self.claim()
+        pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
+        pw.finish_message("msg-1", complete=True)
+        pw.finish_message("msg-1", complete=True)
+        pw.finish_message("msg-1", complete=False)
+        self.assertEqual(self.event_names(), ["audio_completed"])
+        self.assertEqual(self.metadata_keys().count("unavailable_keys"), 0)
+
+        self.claim("msg-2")
+        pw.finish_message("msg-2", complete=False)
+        pw.finish_message("msg-2", complete=True)
+        self.assertEqual(self.event_names(), ["audio_completed", "audio_unavailable"])
 
     def test_a_piece_arriving_after_finish_does_not_reopen_the_message(self):
         self.claim()
@@ -337,8 +422,12 @@ class FinishMessageTests(_VesselTestBase):
         pw.finish_message("msg-1", complete=True)
         wav, _ = pw.synthesize_piece("p1", "二つ目", message_id="msg-1", timeout=5)
         self.assertTrue(wav.startswith(b"RIFF"))
-        self.assertNotIn("msg-1", pw._vessel_messages)
+        self.assertEqual(self.state_of("msg-1"), "closed")
+        self.assertEqual(pw._vessel_messages["msg-1"].pieces, [])
+        pw.finish_message("msg-1", complete=True)
         self.assertEqual(self.event_names(), ["audio_completed"])
+        # 締めの後の断片でも判定は変わらない (通常の合成へ流さない)
+        self.assertTrue(pw.claim_message_voice("p1", "room", "msg-1"))
 
     def test_a_piece_with_nothing_to_voice_does_not_cost_the_bubble_voice(self):
         self.claim()
@@ -361,15 +450,20 @@ class FinishMessageTests(_VesselTestBase):
             pw.synthesize_piece("p1", "二つ目", message_id="msg-2", timeout=5)
         pw.finish_message("msg-2", complete=True)
 
-        self.assertEqual(self.event_names(), ["audio_unavailable", "audio_unavailable"])
+        self.claim("msg-3")
+        pw.finish_message("msg-3", complete=True)  # 切れ端が一つも無い
+
+        self.assertEqual(self.event_names(), ["audio_unavailable"] * 3)
         self.assertNotIn("audio_path", self.metadata_keys())
         self.assertEqual(list(Path(self.tmp.name).glob("*.wav")), [])
 
-    def test_unknown_message_is_told_there_is_no_voice(self):
+    def test_unknown_message_is_left_alone(self):
+        """claim_message_voice を経ていない発話の吹き出しには何も知らせない。"""
         pw.finish_message("msg-unknown", complete=True, pulse_id="pulse-9")
-        pw.finish_message("msg-unknown", complete=True)
-        self.assertEqual(self.event_names(), ["audio_unavailable", "audio_unavailable"])
-        self.assertEqual(self.events[0]["data"]["pulse_id"], "pulse-9")
+        pw.finish_message("msg-unknown", complete=False)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.metadata, [])
+        self.assertNotIn("msg-unknown", pw._vessel_messages)
 
     def test_message_the_hook_did_not_claim_is_left_to_the_normal_path(self):
         pw.register_voice_claim(lambda _p, _b: False)
@@ -378,33 +472,140 @@ class FinishMessageTests(_VesselTestBase):
         pw.finish_message("msg-1", complete=True)
         self.assertEqual(self.events, [])
         self.assertEqual(self.metadata, [])
+        self.assertEqual(self.state_of("msg-1"), "unclaimed")
+
+
+class ClaimDecisionTests(_VesselTestBase):
+    def test_concurrent_first_fragments_run_the_claim_function_once(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        entered = threading.Event()
+        calls: List[str] = []
+        answers = iter([True, False])
+
+        def claim(_persona: str, _building: str) -> bool:
+            calls.append(threading.current_thread().name)
+            entered.set()
+            gate.wait(5)
+            return next(answers)
+
+        pw.register_voice_claim(claim)
+        results: Dict[str, bool] = {}
+
+        def first_fragment(name: str) -> None:
+            results[name] = pw.claim_message_voice("p1", "room", "msg-1")
+
+        first = threading.Thread(target=first_fragment, args=("first",), name="first")
+        second = threading.Thread(target=first_fragment, args=("second",), name="second")
+        first.start()
+        self.assertTrue(entered.wait(5))
+        second.start()
+        time.sleep(0.1)  # second が判定の順番待ちに入る
+        gate.set()
+        first.join(5)
+        second.join(5)
+
+        self.assertEqual(calls, ["first"])
+        self.assertEqual(results, {"first": True, "second": True})
+        self.assertEqual(self.state_of("msg-1"), "open")
+
+    def test_an_in_progress_decision_survives_many_other_messages(self):
+        """上限を超えても、古くなった終わった記録から捨て、進行中の判定は残す。"""
+        claimed = {"value": True}
+        calls: List[str] = []
+
+        def claim(_persona: str, _building: str) -> bool:
+            calls.append("call")
+            return claimed["value"]
+
+        pw.register_voice_claim(claim)
+        with patch.object(pw, "_VESSEL_MESSAGE_MAX", 3):
+            self.assertTrue(pw.claim_message_voice("p1", "room", "live"))
+            for message_id in ("old-0", "old-1"):
+                self.assertTrue(pw.claim_message_voice("p1", "room", message_id))
+                pw.finish_message(message_id, complete=False)
+            self.age("old-0", "old-1")
+            # "live" は並びの先頭 (最も古く触られた) だが、まだ期限内の進行中
+            claimed["value"] = False
+            for message_id in ("new-0", "new-1"):
+                self.assertFalse(pw.claim_message_voice("p1", "room", message_id))
+            self.assertEqual(list(pw._vessel_messages), ["live", "new-0", "new-1"])
+            self.assertEqual(len(calls), 5)
+
+            # 進行中の発話の続きの断片は判定し直さない
+            self.assertTrue(pw.claim_message_voice("p1", "room", "live"))
+            self.assertFalse(pw.claim_message_voice("p1", "room", "new-0"))
+            self.assertEqual(len(calls), 5)
+
+            # 捨てた終わった記録は「知らない発話」: 遅れた切れ端と締めは何も変えない
+            wav, _ = pw.synthesize_piece("p1", "一つ目", message_id="old-0", timeout=5)
+            self.assertTrue(wav.startswith(b"RIFF"))
+            pw.finish_message("old-0", complete=True)
+            self.assertNotIn("old-0", pw._vessel_messages)
+        self.assertEqual(self.event_names(), ["audio_unavailable", "audio_unavailable"])
+        self.assertEqual([e["message_id"] for e in self.events], ["old-0", "old-1"])
 
 
 class ExpiryTests(_VesselTestBase):
     def test_a_claimed_message_without_finish_expires_with_a_notice(self):
         pw.register_voice_claim(lambda _p, _b: True)
         pw.claim_message_voice("p1", "room", "msg-old", pulse_id="pulse-old")
-        pw._vessel_messages["msg-old"].touched_at -= pw._VESSEL_MESSAGE_TTL_SEC + 1
+        self.age("msg-old")
 
         pw.claim_message_voice("p1", "room", "msg-new")
 
-        self.assertNotIn("msg-old", pw._vessel_messages)
-        self.assertIn("msg-new", pw._vessel_messages)
+        self.assertEqual(self.state_of("msg-old"), "closed")
+        self.assertEqual(self.state_of("msg-new"), "open")
         self.assertEqual(self.event_names(), ["audio_unavailable"])
         self.assertEqual(self.events[0]["message_id"], "msg-old")
         self.assertEqual(self.events[0]["data"]["pulse_id"], "pulse-old")
 
-    def test_the_store_is_bounded(self):
+    def test_the_sweeper_expires_an_open_message_without_further_calls(self):
+        with patch.object(pw, "_VESSEL_MESSAGE_TTL_SEC", 0.05), \
+                patch.object(pw, "_VESSEL_SWEEP_INTERVAL_SEC", 0.02):
+            self.claim()
+            self.assertTrue(self.wait_until(lambda: self.event_names() == ["audio_unavailable"]))
+            self.assertEqual(self.events[0]["message_id"], "msg-1")
+            self.assertEqual(self.state_of("msg-1"), "closed")
+            # "open" の記録が無くなったら見回りは自分で抜ける
+            self.assertTrue(self.wait_until(lambda: pw._vessel_sweeper is None))
+            time.sleep(0.1)
+            self.assertEqual(self.event_names(), ["audio_unavailable"])
+
+            # 次に "open" になったら改めて起きる
+            self.claim("msg-2")
+            self.assertTrue(self.wait_until(lambda: len(self.events) == 2))
+            self.assertEqual(self.events[1]["message_id"], "msg-2")
+
+    def test_late_pieces_after_expiry_do_not_reopen_or_complete_the_message(self):
+        self.claim()
+        pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
+        self.age("msg-1")
+        pw._expire_vessel_messages()
+        self.assertEqual(self.event_names(), ["audio_unavailable"])
+
+        wav, _ = pw.synthesize_piece("p1", "二つ目", message_id="msg-1", timeout=5)
+        self.assertTrue(wav.startswith(b"RIFF"))
+        self.assertEqual(self.state_of("msg-1"), "closed")
+        self.assertEqual(pw._vessel_messages["msg-1"].pieces, [])
+        pw.finish_message("msg-1", complete=True)
+        self.assertEqual(self.event_names(), ["audio_unavailable"])
+        self.assertEqual(list(Path(self.tmp.name).glob("*.wav")), [])
+
+    def test_an_open_message_pushed_out_by_the_bound_is_closed_once(self):
         pw.register_voice_claim(lambda _p, _b: True)
         with patch.object(pw, "_VESSEL_MESSAGE_MAX", 2):
             for index in range(4):
                 pw.claim_message_voice("p1", "room", f"msg-{index}")
             self.assertEqual(list(pw._vessel_messages), ["msg-2", "msg-3"])
         self.assertEqual([e["message_id"] for e in self.events], ["msg-0", "msg-1"])
-        with patch.object(pw, "_CLAIM_DECISION_MAX", 3):
-            for index in range(5):
-                pw.claim_message_voice("p1", "room", f"other-{index}")
-            self.assertLessEqual(len(pw._claim_decisions), 3)
+
+        # 追い出された発話に遅れて来た切れ端と締めは、声を返すだけで何も変えない
+        wav, _ = pw.synthesize_piece("p1", "一つ目", message_id="msg-0", timeout=5)
+        self.assertTrue(wav.startswith(b"RIFF"))
+        pw.finish_message("msg-0", complete=True)
+        self.assertNotIn("msg-0", pw._vessel_messages)
+        self.assertEqual(self.event_names(), ["audio_unavailable", "audio_unavailable"])
 
 
 if __name__ == "__main__":

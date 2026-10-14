@@ -970,6 +970,14 @@ class _TTSWorker:
             LOGGER.debug("voice piece cancelled before synthesis (msg=%s)", job.message_id)
             return
         try:
+            # 依頼の受付時 (synthesize_piece) と実際に始める今の間に、アドオンの
+            # 無効化や auto_speak の OFF が挟まりうる (前の合成を待っている間)。
+            # 始める時点の設定で改めて確かめ、エンジンの初期化より前に断る。
+            effective = _get_effective_params(job.persona_id)
+            if not effective.get("_enabled", True):
+                raise VoiceUnavailable("voice-tts addon is disabled")
+            if not effective.get("auto_speak", True):
+                raise VoiceUnavailable("auto_speak is off for this persona")
             setup = self._prepare_synthesis(job.persona_id)
             cleaned = clean_text_for_tts(job.text)
             tts_text = self._apply_pronunciation(cleaned, setup.profile, job.persona_id)
@@ -1238,48 +1246,88 @@ def enqueue_tts(
 # の「声は voice-tts から一切れずつ受け取る」。
 #
 # - Godot アドオンは ``register_voice_claim`` で判定関数を登録する。
-#   ``speak_hook.on_persona_speak`` は message_id ごとの最初の断片で
-#   ``claim_message_voice`` を呼び、真ならその発話を通常の合成 (ブラウザ・
-#   サーバーのスピーカー) に流さない。
+#   ``speak_hook.on_persona_speak`` と Godot アドオンは断片ごとに
+#   ``claim_message_voice`` を呼ぶ。判定は message_id ごとに最初の一回で決まり、
+#   真ならその発話を通常の合成 (ブラウザ・サーバーのスピーカー) に流さない。
 # - Godot アドオンは全身エモート記法で区切った文を一つずつ
 #   ``synthesize_piece`` に渡し、WAV を受け取る。合成は既存のワーカースレッドで
 #   行う。
 # - 最後の区切りを配送したら ``finish_message`` を呼ぶ。voice-tts は切れ端を
 #   順につないで吹き出しの「音声を再生」に付ける (自動再生しない
 #   ``audio_completed``)。一切れでも欠けたら ``notify_no_audio``。
+#
+# message_id ごとの記録 (``_VesselMessage``) は ``_vessel_messages`` 一つにだけ
+# 持ち、その ``state`` が次のように移る:
+#
+#   (記録なし) --claim_message_voice が偽--> "unclaimed"  通常の合成が吹き出しを持つ
+#   (記録なし) --claim_message_voice が真--> "open"       finish_message 側が吹き出しを持つ
+#   "open" --finish_message / 期限切れ / 上限での追い出し--> "closed"
+#
+# - 記録を作るのは ``claim_message_voice`` だけ。一度決まった判定 ("unclaimed"
+#   か、それ以外か) は変わらない。
+# - 吹き出しへの結末の知らせ (``audio_completed`` か ``notify_no_audio``) を
+#   出すのは、"open" から "closed" へ移る一回だけ。
+# - "unclaimed" と "closed" は終わった状態。その後に来た切れ端は声を返すだけで、
+#   記録にも吹き出しにも触らない。
 # ---------------------------------------------------------------------------
 
-#: 仮想身体が引き受けた発話を、``finish_message`` が来ないまま持ち続ける上限秒数。
-#: 過ぎたら ``notify_no_audio`` で吹き出しの待ち表示を解いて捨てる。
+#: "open" の発話を、触られない (断片・切れ端・締めのどれも来ない) まま持ち続ける
+#: 上限秒数。過ぎたら "closed" にし、``notify_no_audio`` で吹き出しの待ち表示を
+#: 解く。上限超過時に終わった記録を先に捨てる目安にも使う。
 _VESSEL_MESSAGE_TTL_SEC = 600.0
-#: 同時に持つ発話の上限 (超えたら古いものから ``notify_no_audio`` して捨てる)。
-_VESSEL_MESSAGE_MAX = 256
-#: message_id ごとの引き受け判定を覚えておく件数の上限。
-_CLAIM_DECISION_MAX = 1024
+#: 期限切れを見回るスレッド (``_run_vessel_sweeper``) の起床間隔 (秒)。
+_VESSEL_SWEEP_INTERVAL_SEC = 30.0
+#: ``_vessel_messages`` に持つ記録の上限 (``_evict_over_capacity_locked``)。
+_VESSEL_MESSAGE_MAX = 4096
+
+_VESSEL_UNCLAIMED = "unclaimed"
+_VESSEL_OPEN = "open"
+_VESSEL_CLOSED = "closed"
 
 
 @dataclass
 class _VesselMessage:
-    """仮想身体が引き受けた一つの発話について、合成した切れ端を順に持つ。
+    """一つの発話の、仮想身体への声の受け渡しの記録。
 
-    ``pieces`` の各要素は依頼順の枠で、合成が成功したら
-    ``(mono float32 の音声, sample_rate)`` が入る。失敗・時間切れの枠は
-    ``None`` のまま残り、``broken`` が立つ。
+    ``state`` は ``_VESSEL_UNCLAIMED`` / ``_VESSEL_OPEN`` / ``_VESSEL_CLOSED``
+    (この節の冒頭の図を参照)。``pieces`` の各要素は依頼順の枠で、合成が成功
+    したら ``(mono float32 の音声, sample_rate)`` が入る。失敗・時間切れの枠は
+    ``None`` のまま残り、``broken`` が立つ。"closed" になったら ``pieces`` は
+    空にする (音声を持ち続けない)。
     """
+    state: str
+    created_at: float
     touched_at: float
     pulse_id: Optional[str] = None
     pieces: List[Optional[Tuple[np.ndarray, int]]] = field(default_factory=list)
     broken: bool = False
 
 
+@dataclass
+class _VesselSweeper:
+    """"open" の記録の期限切れを、API の呼び出しが無くても見回るスレッド。"""
+    thread: threading.Thread
+    stop: threading.Event
+
+
+# _voice_claims・_vessel_messages・_vessel_sweeper を守る。判定関数
+# (_is_voice_claimed) と吹き出しへの知らせ (notify_no_audio /
+# _notify_audio_ready) は、このロックを持ったまま呼ばない。
 _vessel_lock = threading.Lock()
+# claim_message_voice の判定を一件ずつ順に行う。同じ message_id の最初の断片が
+# 同時に来ても、判定関数は一回だけ走る。取る順は _vessel_decision_lock →
+# _vessel_lock で、逆順には取らない。
+_vessel_decision_lock = threading.Lock()
 _voice_claims: List[Callable[[str, str], bool]] = []
+# 並びは触った順 (先頭が最も古い)。上限超過時は先頭から捨てる。
 _vessel_messages: "OrderedDict[str, _VesselMessage]" = OrderedDict()
-_claim_decisions: "OrderedDict[str, bool]" = OrderedDict()
-# finish_message を受け取り終えた message_id。その後に遅れて来た切れ端で
-# 記録を作り直さない (作り直すと、期限切れで声の付いた吹き出しへ二度目の
-# notify_no_audio が飛ぶ)。上限は _CLAIM_DECISION_MAX。
-_finished_messages: "OrderedDict[str, None]" = OrderedDict()
+# 動いている見回りスレッド。"open" の記録が無くなると自分で抜けて None に戻し、
+# 次に記録が "open" になったときに改めて起こす (_ensure_vessel_sweeper_locked)。
+_vessel_sweeper: Optional[_VesselSweeper] = None
+
+# 吹き出しへ notify_no_audio で知らせる、閉じた発話 (message_id, pulse_id,
+# 切れ端の数, 理由)
+_ClosedNotice = Tuple[str, Optional[str], int, str]
 
 
 def _mono_float32(audio: Any) -> np.ndarray:
@@ -1325,7 +1373,10 @@ def unregister_voice_claim(fn: Callable[[str, str], bool]) -> None:
 
 
 def _is_voice_claimed(persona_id: str, building_id: str) -> bool:
-    """登録された判定関数のどれかが真なら真。例外は記録して偽として扱う。"""
+    """登録された判定関数のどれかが真なら真。例外は記録して偽として扱う。
+
+    判定関数は他のアドオンのコードなので、``_vessel_lock`` を持たずに呼ぶ。
+    """
     with _vessel_lock:
         claims = list(_voice_claims)
     for fn in claims:
@@ -1340,55 +1391,139 @@ def _is_voice_claimed(persona_id: str, building_id: str) -> bool:
     return False
 
 
-def _owns_bubble_locked(message_id: str) -> bool:
-    """この発話の吹き出しの声の結末を ``finish_message`` 側が持つか。
+def _touch_locked(message_id: str, entry: _VesselMessage, now: float) -> None:
+    """記録を触った時刻を更新し、上限超過時に捨てる順の末尾へ回す。
 
-    speak_hook が「引き受けない」と判定した発話は通常の合成が吹き出しを
-    持つので、こちらからは何も知らせない。判定が残っていない (speak_hook が
-    判定の前に抜けた・判定を忘れた) 発話はこちらが持つ。``_vessel_lock`` を
-    持った状態で呼ぶ。
+    ``entry`` が既に ``_vessel_messages`` から追い出されていれば並びは触らない。
+    ``_vessel_lock`` を持った状態で呼ぶ。
     """
-    return _claim_decisions.get(message_id) is not False
+    entry.touched_at = now
+    if _vessel_messages.get(message_id) is entry:
+        _vessel_messages.move_to_end(message_id)
+
+
+def _close_locked(message_id: str, entry: _VesselMessage, now: float) -> None:
+    """記録を "closed" にする。``_vessel_lock`` を持った状態で呼ぶ。"""
+    entry.state = _VESSEL_CLOSED
+    entry.pieces = []
+    _touch_locked(message_id, entry, now)
+
+
+def _notify_closed(notices: List[_ClosedNotice]) -> None:
+    """``finish_message`` を待たずに閉じた発話の吹き出しへ、声が無いことを知らせる。
+
+    ``_vessel_lock`` を持たずに呼ぶ。
+    """
+    for message_id, pulse_id, piece_count, reason in notices:
+        LOGGER.warning(
+            "vessel voice for msg=%s closed without finish_message: %s (pieces=%d)",
+            message_id, reason, piece_count,
+        )
+        notify_no_audio(message_id, reason, pulse_id=pulse_id)
 
 
 def _expire_vessel_messages() -> None:
-    """``finish_message`` が来ないまま古くなった発話を捨て、待ち表示を解く。"""
+    """触られないまま ``_VESSEL_MESSAGE_TTL_SEC`` を過ぎた "open" の発話を閉じる。
+
+    閉じた発話の吹き出しには ``notify_no_audio`` で待ち表示を解かせる。
+    見回りスレッド (``_run_vessel_sweeper``) と各 API の入口から呼ばれる。
+    """
     now = time.monotonic()
-    expired: List[Tuple[str, _VesselMessage, bool]] = []
+    notices: List[_ClosedNotice] = []
     with _vessel_lock:
         for message_id, entry in list(_vessel_messages.items()):
+            if entry.state != _VESSEL_OPEN:
+                continue
             if now - entry.touched_at > _VESSEL_MESSAGE_TTL_SEC:
-                del _vessel_messages[message_id]
-                expired.append((message_id, entry, _owns_bubble_locked(message_id)))
-        while len(_vessel_messages) > _VESSEL_MESSAGE_MAX:
-            message_id, entry = _vessel_messages.popitem(last=False)
-            expired.append((message_id, entry, _owns_bubble_locked(message_id)))
-    for message_id, entry, owns in expired:
-        LOGGER.warning(
-            "vessel voice for msg=%s expired without finish_message (pieces=%d)",
-            message_id, len(entry.pieces),
-        )
-        if owns:
-            notify_no_audio(
-                message_id,
-                "the vessel never finished this message",
-                pulse_id=entry.pulse_id,
-            )
+                notices.append((
+                    message_id, entry.pulse_id, len(entry.pieces),
+                    "the vessel never finished this message",
+                ))
+                _close_locked(message_id, entry, now)
+    _notify_closed(notices)
 
 
-def _touch_vessel_message_locked(
-    message_id: str, pulse_id: Optional[str] = None
-) -> _VesselMessage:
-    entry = _vessel_messages.get(message_id)
-    if entry is None:
-        entry = _VesselMessage(touched_at=time.monotonic(), pulse_id=pulse_id)
-        _vessel_messages[message_id] = entry
-    else:
-        entry.touched_at = time.monotonic()
+def _evict_over_capacity_locked(now: float) -> List[_ClosedNotice]:
+    """``_vessel_messages`` を ``_VESSEL_MESSAGE_MAX`` 件に収める。
+
+    まず、終わった記録 ("unclaimed" / "closed") のうち
+    ``_VESSEL_MESSAGE_TTL_SEC`` より長く触られていないものを古い順に捨てる。
+    それでも超えていれば、状態を問わず古い順に捨てる。"open" の記録を捨てるのは
+    期限切れと同じ扱いで、戻り値に入れて呼び出し側がロックの外で
+    ``_notify_closed`` する。
+
+    捨てた message_id は、以後「知らない発話」になる。その後に遅れて来た
+    切れ端は声を返すだけで、記録も吹き出しも変えない。同じ message_id で
+    ``claim_message_voice`` が呼ばれれば改めて判定される (上限を超えるほどの
+    発話が ``_VESSEL_MESSAGE_TTL_SEC`` の間に来たときだけ起きる)。
+    ``_vessel_lock`` を持った状態で呼ぶ。
+    """
+    if len(_vessel_messages) <= _VESSEL_MESSAGE_MAX:
+        return []
+    for message_id, entry in list(_vessel_messages.items()):
+        if len(_vessel_messages) <= _VESSEL_MESSAGE_MAX:
+            break
+        if entry.state != _VESSEL_OPEN and now - entry.touched_at > _VESSEL_MESSAGE_TTL_SEC:
+            del _vessel_messages[message_id]
+    notices: List[_ClosedNotice] = []
+    while len(_vessel_messages) > _VESSEL_MESSAGE_MAX:
+        message_id, entry = _vessel_messages.popitem(last=False)
+        if entry.state == _VESSEL_OPEN:
+            notices.append((
+                message_id, entry.pulse_id, len(entry.pieces),
+                "too many vessel messages were in progress",
+            ))
+            _close_locked(message_id, entry, now)
+    return notices
+
+
+def _run_vessel_sweeper(stop: threading.Event) -> None:
+    """``_VESSEL_SWEEP_INTERVAL_SEC`` ごとに ``_expire_vessel_messages`` を回す。
+
+    "open" の記録が無くなったら ``_vessel_sweeper`` を None に戻して抜ける。
+    ``stop`` が立つか、``_vessel_sweeper`` が別の見回りに替わっていたら抜ける。
+    """
+    global _vessel_sweeper
+    while not stop.wait(_VESSEL_SWEEP_INTERVAL_SEC):
+        with _vessel_lock:
+            if _vessel_sweeper is None or _vessel_sweeper.stop is not stop:
+                return
+        try:
+            _expire_vessel_messages()
+        except Exception:
+            LOGGER.exception("vessel voice sweeper failed to expire messages")
+        with _vessel_lock:
+            if _vessel_sweeper is None or _vessel_sweeper.stop is not stop:
+                return
+            if not any(entry.state == _VESSEL_OPEN for entry in _vessel_messages.values()):
+                _vessel_sweeper = None
+                return
+
+
+def _ensure_vessel_sweeper_locked() -> None:
+    """見回りスレッドが動いていなければ起こす。``_vessel_lock`` を持った状態で呼ぶ。"""
+    global _vessel_sweeper
+    if _vessel_sweeper is not None and _vessel_sweeper.thread.is_alive():
+        return
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=_run_vessel_sweeper, args=(stop,),
+        name="voice-tts-vessel-sweeper", daemon=True,
+    )
+    _vessel_sweeper = _VesselSweeper(thread=thread, stop=stop)
+    thread.start()
+
+
+def _recall_claim(message_id: str, pulse_id: Optional[str]) -> Optional[bool]:
+    """決まっている判定を返す (記録が無ければ None)。記録は触る。"""
+    with _vessel_lock:
+        entry = _vessel_messages.get(message_id)
+        if entry is None:
+            return None
+        _touch_locked(message_id, entry, time.monotonic())
         if entry.pulse_id is None:
             entry.pulse_id = pulse_id
-        _vessel_messages.move_to_end(message_id)
-    return entry
+        return entry.state != _VESSEL_UNCLAIMED
 
 
 def claim_message_voice(
@@ -1399,35 +1534,41 @@ def claim_message_voice(
 ) -> bool:
     """この発話の声を仮想身体が引き受けるかを、message_id ごとに一度だけ決める。
 
-    ``speak_hook.on_persona_speak`` が各断片で呼ぶ。最初の断片で
-    ``_is_voice_claimed`` を評価して覚え、同じ message_id の以降の断片には
-    同じ答えを返す (途中で Vessel が繋がった・切れた場合も変えない)。
-    引き受けた発話は ``finish_message`` が来るまで (来なければ
-    ``_VESSEL_MESSAGE_TTL_SEC`` まで) 記録しておく。
+    ``speak_hook.on_persona_speak`` と Godot アドオンが断片ごとに呼ぶ。最初の
+    呼び出しで ``_is_voice_claimed`` を評価して記録を作り (真なら "open"、偽なら
+    "unclaimed")、以降は同じ答えを返す。途中で Vessel が繋がった・切れた場合も、
+    記録が "closed" になった後も変えない。同じ message_id の最初の呼び出しが
+    同時に来ても、判定関数は一回だけ走る (``_vessel_decision_lock``)。
+
+    呼ぶたびに記録を触るので、断片が続いている "open" の発話は期限切れにならない。
     """
     _expire_vessel_messages()
-    with _vessel_lock:
-        cached = _claim_decisions.get(message_id)
-    if cached is not None:
-        return cached
-    claimed = _is_voice_claimed(persona_id, building_id or "")
-    with _vessel_lock:
-        cached = _claim_decisions.get(message_id)
-        if cached is not None:
-            # 同じ発話の別の断片が先に決めていた
-            return cached
-        _claim_decisions[message_id] = claimed
-        while len(_claim_decisions) > _CLAIM_DECISION_MAX:
-            _claim_decisions.popitem(last=False)
-        if claimed:
-            _touch_vessel_message_locked(message_id, pulse_id)
+    decided = _recall_claim(message_id, pulse_id)
+    if decided is not None:
+        return decided
+    with _vessel_decision_lock:
+        decided = _recall_claim(message_id, pulse_id)
+        if decided is not None:
+            # 同じ発話の別の断片が、判定の順番待ちの間に先に決めていた
+            return decided
+        claimed = _is_voice_claimed(persona_id, building_id or "")
+        now = time.monotonic()
+        with _vessel_lock:
+            _vessel_messages[message_id] = _VesselMessage(
+                state=_VESSEL_OPEN if claimed else _VESSEL_UNCLAIMED,
+                created_at=now,
+                touched_at=now,
+                pulse_id=pulse_id,
+            )
+            evicted = _evict_over_capacity_locked(now)
+            if claimed:
+                _ensure_vessel_sweeper_locked()
     if claimed:
         LOGGER.debug(
             "voice of msg=%s is claimed by the vessel (persona=%s building=%s)",
             message_id, persona_id, building_id,
         )
-    # 上限を超えた分は次の呼び出しを待たずに捨てる
-    _expire_vessel_messages()
+    _notify_closed(evicted)
     return claimed
 
 
@@ -1443,31 +1584,39 @@ def synthesize_piece(
     合成は既存のワーカースレッドに並べて行う (通常の合成とエンジンを同時に
     使わない)。声プロファイル・エンジン・話速などの合成パラメータ・読み方の
     辞書・読み上げ前の整形 (``clean_text_for_tts``) は通常の合成と同じ。
-    再生・画面への通知・ファイル保存はしない。成功した切れ端は message_id
-    ごとに依頼順で取っておき、``finish_message`` で吹き出しの声にする。
+    再生・画面への通知・ファイル保存はしない。
+
+    message_id の記録が "open" のときだけ、切れ端を依頼順に取っておき、
+    ``finish_message`` で吹き出しの声にする。記録が無い・"unclaimed"・"closed"
+    の発話では声を返すだけで、記録にも吹き出しにも触らない。
 
     Raises:
+        NothingToVoice: 整形後に読み上げる文字が残らない (記録には触らない)。
         VoiceUnavailable: アドオンが無効・このペルソナの ``auto_speak`` が OFF・
-            声プロファイルが無い・整形後に読み上げる文字が残らない。
+            声プロファイルが無い。依頼の受付時と、ワーカーが合成を始める時の
+            両方で確かめる。
         TimeoutError: ``timeout`` 秒までに合成が終わらなかった。
         その他: エンジンの例外をそのまま送出する。
 
-    どの例外の場合も、この発話は欠けありとして記録され、``finish_message``
-    は吹き出しに声を付けない。
+    ``NothingToVoice`` 以外の例外では、"open" の発話は欠けありとして記録され、
+    ``finish_message`` は吹き出しに声を付けない。
     """
     _expire_vessel_messages()
     if not clean_text_for_tts(text).strip():
         # 整形すると読み上げる文字が残らない区切り (URL だけ等) は、もともと
         # 声の無い区切り。欠けではないので、吹き出しの声を諦める理由にしない。
         raise NothingToVoice("no voiceable text in this piece")
+    entry: Optional[_VesselMessage]
+    slot = -1
     with _vessel_lock:
-        if message_id in _finished_messages:
-            # 締めの後に遅れて来た切れ端。声は返すが、吹き出しの声には加えない
-            entry = _VesselMessage(touched_at=time.monotonic())
+        entry = _vessel_messages.get(message_id)
+        if entry is not None and entry.state == _VESSEL_OPEN:
+            slot = len(entry.pieces)
+            entry.pieces.append(None)
+            _touch_locked(message_id, entry, time.monotonic())
         else:
-            entry = _touch_vessel_message_locked(message_id)
-        slot = len(entry.pieces)
-        entry.pieces.append(None)
+            # 知らない・引き受けていない・閉じた発話。声は返すが、記録には加えない
+            entry = None
     try:
         params = _get_effective_params(persona_id)
         if not params.get("_enabled", True):
@@ -1489,13 +1638,17 @@ def synthesize_piece(
                 f"voice piece was not synthesized within {timeout:.1f}s"
             ) from None
     except Exception:
-        with _vessel_lock:
-            entry.broken = True
-            entry.touched_at = time.monotonic()
+        if entry is not None:
+            with _vessel_lock:
+                if entry.state == _VESSEL_OPEN:
+                    entry.broken = True
+                    _touch_locked(message_id, entry, time.monotonic())
         raise
-    with _vessel_lock:
-        entry.pieces[slot] = (audio, sample_rate)
-        entry.touched_at = time.monotonic()
+    if entry is not None:
+        with _vessel_lock:
+            if entry.state == _VESSEL_OPEN:
+                entry.pieces[slot] = (audio, sample_rate)
+                _touch_locked(message_id, entry, time.monotonic())
     return _wav_bytes(audio, sample_rate), len(audio) / float(sample_rate)
 
 
@@ -1507,44 +1660,47 @@ def finish_message(
 ) -> None:
     """仮想身体がこの発話の最後の区切りまで配送し終えたことを受け取る。
 
-    ``complete`` が真で、欠けた切れ端が無く、全切れ端の sample_rate が揃って
-    いれば、切れ端を依頼順につないで保存し、吹き出しの「音声を再生」を出す。
-    知らせには ``audio_completed`` を使う (画面の自動再生 ``auto_play_tts`` は
-    ``audio_ready`` だけを購読しているので、ブラウザでは鳴らない)。
-    それ以外は ``notify_no_audio`` で「この吹き出しに音声は無い」を知らせる。
-    どちらの場合も記録は消す。知らない message_id でも同じ規則で
-    (切れ端が無いので) ``notify_no_audio`` になる。
+    記録が "open" のときだけ "closed" にし、吹き出しへ結末を一度だけ知らせる。
+    ``complete`` が真で、切れ端が一つ以上あり、欠けた切れ端が無く、全切れ端の
+    sample_rate が揃っていれば、切れ端を依頼順につないで保存し、吹き出しの
+    「音声を再生」を出す。知らせには ``audio_completed`` を使う (画面の自動再生
+    ``auto_play_tts`` は ``audio_ready`` だけを購読しているので、ブラウザでは
+    鳴らない)。それ以外は ``notify_no_audio`` で「この吹き出しに音声は無い」を
+    知らせる。
 
-    speak_hook が「引き受けない」と判定した発話は、通常の合成が吹き出しを
-    持っているので、記録を捨てるだけで何も知らせない。
+    記録が無い・"unclaimed"・"closed" の発話では何も知らせず、記録も変えない
+    (二度目の呼び出しは何もしない)。"unclaimed" は通常の合成が吹き出しを持ち、
+    "closed" は既に結末を知らせ済み。記録が無いのは ``claim_message_voice`` を
+    経ていないか、上限で追い出された発話 (追い出しが "open" の記録だったなら、
+    そのときに ``notify_no_audio`` 済み)。
     """
     _expire_vessel_messages()
     with _vessel_lock:
-        entry = _vessel_messages.pop(message_id, None)
-        owns = _owns_bubble_locked(message_id)
-        _finished_messages[message_id] = None
-        _finished_messages.move_to_end(message_id)
-        while len(_finished_messages) > _CLAIM_DECISION_MAX:
-            _finished_messages.popitem(last=False)
-    if not owns:
+        entry = _vessel_messages.get(message_id)
+        state = entry.state if entry is not None else None
+        if entry is not None and state == _VESSEL_OPEN:
+            slots = entry.pieces
+            broken = entry.broken
+            stored_pulse = entry.pulse_id
+            _close_locked(message_id, entry, time.monotonic())
+    if entry is None or state != _VESSEL_OPEN:
         LOGGER.info(
-            "finish_message: msg=%s was not claimed by the vessel; "
-            "the normal voice path owns the bubble",
-            message_id,
+            "finish_message: msg=%s is %s; nothing to tell the bubble",
+            message_id, state or "unknown",
         )
         return
-    pulse = pulse_id if pulse_id is not None else (entry.pulse_id if entry else None)
+    pulse = pulse_id if pulse_id is not None else stored_pulse
 
     reason: Optional[str] = None
     pieces: List[Tuple[np.ndarray, int]] = []
     if not complete:
         reason = "the vessel did not deliver every piece of this message"
-    elif entry is None or not entry.pieces:
+    elif not slots:
         reason = "no voice pieces were synthesized for this message"
-    elif entry.broken or any(piece is None for piece in entry.pieces):
+    elif broken or any(piece is None for piece in slots):
         reason = "a voice piece of this message was not synthesized"
     else:
-        pieces = [piece for piece in entry.pieces if piece is not None]
+        pieces = [piece for piece in slots if piece is not None]
         if len({sample_rate for _, sample_rate in pieces}) != 1:
             reason = "voice pieces of this message have different sample rates"
     if reason is not None:

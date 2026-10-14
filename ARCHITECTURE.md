@@ -377,19 +377,38 @@ unregister する。ハンドラが例外を投げても本体側で隔離され
 `sys.modules.get("tools._loaded.speak.playback_worker")` でこの API に届く。
 
 - `register_voice_claim(fn)` / `unregister_voice_claim(fn)`: Godot アドオンが
-  `fn(persona_id, building_id) -> bool` を登録する。`speak_hook` は message_id
-  ごとの最初の断片で `claim_message_voice` を呼び、真ならその発話を通常の合成
-  キューへ入れない (締めの合図も含めて、判定は発話の途中で変えない)。
+  `fn(persona_id, building_id) -> bool` を登録する。`speak_hook` と Godot アドオンは
+  断片ごとに `claim_message_voice` を呼ぶ。判定は message_id ごとの最初の一回で
+  決まり (同時に来ても `fn` は一回だけ走る)、真ならその発話を通常の合成キューへ
+  入れない (締めの合図も含めて、判定は発話の途中で変えない)。
 - `synthesize_piece(persona_id, text, *, message_id, timeout)`: Godot アドオンが
   全身エモート記法で区切った一切れを、既存のワーカースレッドで非ストリーミング
   合成し `(WAV バイト列, 秒数)` を返す。声プロファイル・合成パラメータ・読み方の
   辞書・`clean_text_for_tts` は `_process` と同じ (`_prepare_synthesis` を共有)。
-  アドオン無効・`auto_speak` OFF・声プロファイル無しは `VoiceUnavailable`、時間切れは
+  アドオン無効・`auto_speak` OFF・声プロファイル無しは `VoiceUnavailable` (無効化と
+  `auto_speak` は、ワーカーが実際に合成を始める時点でも確かめ直す)、時間切れは
   `TimeoutError`。再生・audio_stream・通知・保存はしない。
 - `finish_message(message_id, *, complete, pulse_id=None)`: 切れ端を依頼順につないで
   保存し、`audio_completed` (画面の自動再生が購読しない) で吹き出しに声を付ける。
   欠けた切れ端があるか `complete=False` なら `notify_no_audio`。
-- `finish_message` が来ない発話は 600 秒で `notify_no_audio` して捨てる。
+
+message_id ごとの記録は `_vessel_messages` 一つにだけ持ち、`state` が次のように移る。
+記録を作るのは `claim_message_voice` だけ。
+
+| state | 意味 | `synthesize_piece` | `finish_message` |
+|---|---|---|---|
+| (記録なし) | 判定前、または上限で追い出された | 声を返すだけ | 何もしない |
+| `unclaimed` | 判定が偽。通常の合成が吹き出しを持つ | 声を返すだけ | 何もしない |
+| `open` | 判定が真。吹き出しの結末はこちらが持つ | 切れ端を依頼順に取っておく | `closed` にして結末を一度だけ知らせる |
+| `closed` | 締め・期限切れ・上限での追い出しのどれかで閉じた | 声を返すだけ | 何もしない |
+
+- `open` のまま 600 秒 (`_VESSEL_MESSAGE_TTL_SEC`) 触られない発話は `closed` にして
+  `notify_no_audio` する。API が呼ばれなくても効くよう、`open` の記録がある間だけ
+  見回りスレッド (`_run_vessel_sweeper`、30 秒ごと) が動く。
+- 記録は 4096 件 (`_VESSEL_MESSAGE_MAX`) まで。超えたら、600 秒より長く触られていない
+  `unclaimed` / `closed` を古い順に捨て、それでも超えていれば状態を問わず古い順に
+  捨てる (`open` を捨てるのは期限切れと同じ扱いで `notify_no_audio`)。捨てた
+  message_id は以後「記録なし」になる。
 
 ### 旧 Playbook 上書き方式 (v0.3.x まで)
 
