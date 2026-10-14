@@ -20,12 +20,17 @@ _HEADER = re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE)
 _LIST_MARK = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
 _BLOCKQUOTE = re.compile(r"^\s*>\s?", re.MULTILINE)
 _MULTI_BLANK = re.compile(r"\n{3,}")
+# 仮想身体 (Godot vessel アドオン) の全身エモート記法 ``{"body_emote": "smile"}``。
+# 身体への合図なので声に出さない。値が未知・壊れていても記法ごと消す
+# (アドオン側 body_emotes.py の _MARKER と同じ形)。
+_BODY_EMOTE = re.compile(r'\{\s*"body_emote"\s*:\s*(?:"(?:\\.|[^"\\])*"|[^{}]*?)\s*\}')
 
 
 def clean_text_for_tts(text: str) -> str:
     if not text:
         return ""
-    t = _MD_IMAGE.sub("", text)
+    t = _BODY_EMOTE.sub("", text)
+    t = _MD_IMAGE.sub("", t)
     t = _MD_LINK.sub(r"\1", t)
     t = _MD_REF_LINK.sub(r"\1", t)
     t = _BARE_URL.sub("", t)
