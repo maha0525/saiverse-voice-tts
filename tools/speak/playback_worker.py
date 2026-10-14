@@ -1273,12 +1273,16 @@ def enqueue_tts(
 
 #: "open" の発話を、触られない (断片・切れ端・締めのどれも来ない) まま持ち続ける
 #: 上限秒数。過ぎたら "closed" にし、``notify_no_audio`` で吹き出しの待ち表示を
-#: 解く。上限超過時に終わった記録を先に捨てる目安にも使う。
+#: 解く。
 _VESSEL_MESSAGE_TTL_SEC = 600.0
 #: 期限切れを見回るスレッド (``_run_vessel_sweeper``) の起床間隔 (秒)。
 _VESSEL_SWEEP_INTERVAL_SEC = 30.0
-#: ``_vessel_messages`` に持つ記録の上限 (``_evict_over_capacity_locked``)。
+#: ``_vessel_messages`` の件数の目安。超えたら、終わってから
+#: ``_VESSEL_RETAIN_TERMINAL_SEC`` 以上たった記録を捨てる
+#: (``_evict_over_capacity_locked``)。"open" の記録は件数では捨てない。
 _VESSEL_MESSAGE_MAX = 4096
+#: 終わった記録 ("unclaimed" / "closed") を残しておく秒数 (1 日)。
+_VESSEL_RETAIN_TERMINAL_SEC = 86400.0
 
 _VESSEL_UNCLAIMED = "unclaimed"
 _VESSEL_OPEN = "open"
@@ -1444,37 +1448,25 @@ def _expire_vessel_messages() -> None:
 
 
 def _evict_over_capacity_locked(now: float) -> List[_ClosedNotice]:
-    """``_vessel_messages`` を ``_VESSEL_MESSAGE_MAX`` 件に収める。
+    """件数が ``_VESSEL_MESSAGE_MAX`` を超えたら、捨ててよい記録だけを捨てる。
 
-    まず、終わった記録 ("unclaimed" / "closed") のうち
-    ``_VESSEL_MESSAGE_TTL_SEC`` より長く触られていないものを古い順に捨てる。
-    それでも超えていれば、状態を問わず古い順に捨てる。"open" の記録を捨てるのは
-    期限切れと同じ扱いで、戻り値に入れて呼び出し側がロックの外で
-    ``_notify_closed`` する。
-
-    捨てた message_id は、以後「知らない発話」になる。その後に遅れて来た
-    切れ端は声を返すだけで、記録も吹き出しも変えない。同じ message_id で
-    ``claim_message_voice`` が呼ばれれば改めて判定される (上限を超えるほどの
-    発話が ``_VESSEL_MESSAGE_TTL_SEC`` の間に来たときだけ起きる)。
-    ``_vessel_lock`` を持った状態で呼ぶ。
+    捨ててよいのは、終わった記録 ("unclaimed" / "closed") のうち
+    ``_VESSEL_RETAIN_TERMINAL_SEC`` (1 日) より長く触られていないものだけ。
+    "open" の記録は件数では捨てない (``_VESSEL_MESSAGE_TTL_SEC`` の期限切れで
+    だけ閉じる)。終わった記録も 1 日は残すので、遅れて来た断片で判定がやり直され
+    たり、閉じた発話が開き直されたりしない (終わった記録は切れ端を持たない
+    小さな記録なので、上限を超えて残っても構わない)。
+    戻り値は互換のため残している (常に空)。``_vessel_lock`` を持った状態で呼ぶ。
     """
     if len(_vessel_messages) <= _VESSEL_MESSAGE_MAX:
         return []
     for message_id, entry in list(_vessel_messages.items()):
         if len(_vessel_messages) <= _VESSEL_MESSAGE_MAX:
             break
-        if entry.state != _VESSEL_OPEN and now - entry.touched_at > _VESSEL_MESSAGE_TTL_SEC:
+        if (entry.state != _VESSEL_OPEN
+                and now - entry.touched_at > _VESSEL_RETAIN_TERMINAL_SEC):
             del _vessel_messages[message_id]
-    notices: List[_ClosedNotice] = []
-    while len(_vessel_messages) > _VESSEL_MESSAGE_MAX:
-        message_id, entry = _vessel_messages.popitem(last=False)
-        if entry.state == _VESSEL_OPEN:
-            notices.append((
-                message_id, entry.pulse_id, len(entry.pieces),
-                "too many vessel messages were in progress",
-            ))
-            _close_locked(message_id, entry, now)
-    return notices
+    return []
 
 
 def _run_vessel_sweeper(stop: threading.Event) -> None:
@@ -1524,6 +1516,18 @@ def _recall_claim(message_id: str, pulse_id: Optional[str]) -> Optional[bool]:
         if entry.pulse_id is None:
             entry.pulse_id = pulse_id
         return entry.state != _VESSEL_UNCLAIMED
+
+
+def vessel_owns_message(message_id: str) -> bool:
+    """この発話の吹き出しの声の結末を、仮想身体の経路 (``finish_message`` /
+    期限切れ) が持っているか。記録を触らない。
+
+    ``speak_hook`` が自動発話 OFF の「音声なし」を出す前に確かめ、仮想身体が
+    引き受けた発話には重ねて知らせないために使う。
+    """
+    with _vessel_lock:
+        entry = _vessel_messages.get(message_id)
+        return entry is not None and entry.state != _VESSEL_UNCLAIMED
 
 
 def claim_message_voice(

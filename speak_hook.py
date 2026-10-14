@@ -19,6 +19,7 @@ from tools._loaded.speak.playback_worker import (
     enqueue_tts,
     get_effective_params,
     notify_no_audio,
+    vessel_owns_message,
 )
 from tools._loaded.speak.text_cleaner import clean_text_for_tts
 
@@ -66,7 +67,9 @@ def on_persona_speak(
         # 自動発話を切っている回も、締めの合図のときだけ「この吹き出しに音声は
         # 無い」を知らせる。知らせないと画面の音声ボタンが合図を待って回り続ける
         # (手動の再生成で後から音声が作られたら、そちらが優先して表示される)。
-        if _kwargs.get("is_final", True):
+        # 仮想身体が引き受けた発話は、吹き出しの結末を finish_message (または
+        # 期限切れ) が一度だけ知らせるので、ここでは重ねない。
+        if _kwargs.get("is_final", True) and not vessel_owns_message(message_id):
             notify_no_audio(
                 message_id,
                 "auto_speak is off for this persona",

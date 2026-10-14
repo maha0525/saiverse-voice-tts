@@ -509,8 +509,12 @@ class ClaimDecisionTests(_VesselTestBase):
         self.assertEqual(results, {"first": True, "second": True})
         self.assertEqual(self.state_of("msg-1"), "open")
 
-    def test_an_in_progress_decision_survives_many_other_messages(self):
-        """上限を超えても、古くなった終わった記録から捨て、進行中の判定は残す。"""
+    def test_the_bound_never_drops_a_decision_that_traffic_can_still_reach(self):
+        """件数の目安を超えても、"open" と、終わってから 1 日たっていない記録は捨てない。
+
+        捨てるのは 1 日以上前に終わった記録だけ。進行中の判定がやり直されたり、
+        閉じた発話が新しい発話として開き直されたりしない。
+        """
         claimed = {"value": True}
         calls: List[str] = []
 
@@ -519,31 +523,33 @@ class ClaimDecisionTests(_VesselTestBase):
             return claimed["value"]
 
         pw.register_voice_claim(claim)
-        with patch.object(pw, "_VESSEL_MESSAGE_MAX", 3):
+        with patch.object(pw, "_VESSEL_MESSAGE_MAX", 2):
             self.assertTrue(pw.claim_message_voice("p1", "room", "live"))
-            for message_id in ("old-0", "old-1"):
-                self.assertTrue(pw.claim_message_voice("p1", "room", message_id))
-                pw.finish_message(message_id, complete=False)
-            self.age("old-0", "old-1")
-            # "live" は並びの先頭 (最も古く触られた) だが、まだ期限内の進行中
+            self.assertTrue(pw.claim_message_voice("p1", "room", "done"))
+            pw.finish_message("done", complete=False)
+            self.assertTrue(pw.claim_message_voice("p1", "room", "ancient"))
+            pw.finish_message("ancient", complete=False)
+            with pw._vessel_lock:
+                pw._vessel_messages["ancient"].touched_at -= pw._VESSEL_RETAIN_TERMINAL_SEC + 1
             claimed["value"] = False
-            for message_id in ("new-0", "new-1"):
+            for message_id in ("new-0", "new-1", "new-2"):
                 self.assertFalse(pw.claim_message_voice("p1", "room", message_id))
-            self.assertEqual(list(pw._vessel_messages), ["live", "new-0", "new-1"])
-            self.assertEqual(len(calls), 5)
+            # 1 日前に終わった "ancient" だけが捨てられ、目安を超えても他は残る
+            self.assertNotIn("ancient", pw._vessel_messages)
+            self.assertEqual(set(pw._vessel_messages), {"live", "done", "new-0", "new-1", "new-2"})
+            calls_before = len(calls)
 
-            # 進行中の発話の続きの断片は判定し直さない
+            # 判定は変わらず、関数も呼び直さない
             self.assertTrue(pw.claim_message_voice("p1", "room", "live"))
+            self.assertTrue(pw.claim_message_voice("p1", "room", "done"))
             self.assertFalse(pw.claim_message_voice("p1", "room", "new-0"))
-            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(calls), calls_before)
 
-            # 捨てた終わった記録は「知らない発話」: 遅れた切れ端と締めは何も変えない
-            wav, _ = pw.synthesize_piece("p1", "一つ目", message_id="old-0", timeout=5)
-            self.assertTrue(wav.startswith(b"RIFF"))
-            pw.finish_message("old-0", complete=True)
-            self.assertNotIn("old-0", pw._vessel_messages)
-        self.assertEqual(self.event_names(), ["audio_unavailable", "audio_unavailable"])
-        self.assertEqual([e["message_id"] for e in self.events], ["old-0", "old-1"])
+            # 閉じた発話に遅れて来た切れ端と締めは何も変えない
+            pw.synthesize_piece("p1", "一つ目", message_id="done", timeout=5)
+            pw.finish_message("done", complete=True)
+            self.assertEqual(self.state_of("done"), "closed")
+        self.assertEqual([e["message_id"] for e in self.events], ["done", "ancient"])
 
 
 class ExpiryTests(_VesselTestBase):
@@ -592,20 +598,27 @@ class ExpiryTests(_VesselTestBase):
         self.assertEqual(self.event_names(), ["audio_unavailable"])
         self.assertEqual(list(Path(self.tmp.name).glob("*.wav")), [])
 
-    def test_an_open_message_pushed_out_by_the_bound_is_closed_once(self):
+    def test_open_messages_are_never_pushed_out_by_the_bound(self):
         pw.register_voice_claim(lambda _p, _b: True)
         with patch.object(pw, "_VESSEL_MESSAGE_MAX", 2):
             for index in range(4):
                 pw.claim_message_voice("p1", "room", f"msg-{index}")
-            self.assertEqual(list(pw._vessel_messages), ["msg-2", "msg-3"])
-        self.assertEqual([e["message_id"] for e in self.events], ["msg-0", "msg-1"])
+            self.assertEqual(list(pw._vessel_messages), [f"msg-{i}" for i in range(4)])
+            for index in range(4):
+                pw.synthesize_piece("p1", "一つ目", message_id=f"msg-{index}", timeout=5)
+                pw.finish_message(f"msg-{index}", complete=True)
+        self.assertEqual(self.event_names(), ["audio_completed"] * 4)
 
-        # 追い出された発話に遅れて来た切れ端と締めは、声を返すだけで何も変えない
-        wav, _ = pw.synthesize_piece("p1", "一つ目", message_id="msg-0", timeout=5)
-        self.assertTrue(wav.startswith(b"RIFF"))
-        pw.finish_message("msg-0", complete=True)
-        self.assertNotIn("msg-0", pw._vessel_messages)
-        self.assertEqual(self.event_names(), ["audio_unavailable", "audio_unavailable"])
+    def test_auto_speak_turned_off_mid_message_tells_the_bubble_once(self):
+        """仮想身体が引き受けた発話では、自動発話 OFF の「音声なし」を speak_hook が重ねない。"""
+        self.claim()
+        pw.synthesize_piece("p1", "一つ目", message_id="msg-1", timeout=5)
+        self.params["auto_speak"] = False
+        import speak_hook
+
+        speak_hook.on_persona_speak("p1", "", "msg-1", building_id="room", is_final=True)
+        pw.finish_message("msg-1", complete=True)
+        self.assertEqual(self.event_names(), ["audio_completed"])
 
 
 if __name__ == "__main__":
