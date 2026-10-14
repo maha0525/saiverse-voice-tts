@@ -1272,9 +1272,13 @@ def enqueue_tts(
 # ---------------------------------------------------------------------------
 
 #: "open" の発話を、触られない (断片・切れ端・締めのどれも来ない) まま持ち続ける
-#: 上限秒数。過ぎたら "closed" にし、``notify_no_audio`` で吹き出しの待ち表示を
-#: 解く。
-_VESSEL_MESSAGE_TTL_SEC = 600.0
+#: 上限秒数。過ぎたら "closed" にし、``notify_no_audio`` を出す。
+#: これは仮想身体のアドオンが締めを送れなくなった (途中で無効化された・落ちた)
+#: ときの最後の網で、アドオンは受け付けた発話を必ず ``finish_message`` で締める。
+#: アドオンの順番待ちが混んで、受け付け済みの発話が長く待つ回を誤って閉じない
+#: よう長めに取る (画面の待ち表示はフロントが 300 秒で自分から消すので、
+#: 長くしても待ち表示が残り続けることはない)。
+_VESSEL_MESSAGE_TTL_SEC = 3600.0
 #: 期限切れを見回るスレッド (``_run_vessel_sweeper``) の起床間隔 (秒)。
 _VESSEL_SWEEP_INTERVAL_SEC = 30.0
 #: ``_vessel_messages`` の件数の目安。超えたら、終わってから
@@ -1516,18 +1520,6 @@ def _recall_claim(message_id: str, pulse_id: Optional[str]) -> Optional[bool]:
         if entry.pulse_id is None:
             entry.pulse_id = pulse_id
         return entry.state != _VESSEL_UNCLAIMED
-
-
-def vessel_owns_message(message_id: str) -> bool:
-    """この発話の吹き出しの声の結末を、仮想身体の経路 (``finish_message`` /
-    期限切れ) が持っているか。記録を触らない。
-
-    ``speak_hook`` が自動発話 OFF の「音声なし」を出す前に確かめ、仮想身体が
-    引き受けた発話には重ねて知らせないために使う。
-    """
-    with _vessel_lock:
-        entry = _vessel_messages.get(message_id)
-        return entry is not None and entry.state != _VESSEL_UNCLAIMED
 
 
 def claim_message_voice(

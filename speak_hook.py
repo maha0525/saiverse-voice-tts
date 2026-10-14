@@ -19,7 +19,6 @@ from tools._loaded.speak.playback_worker import (
     enqueue_tts,
     get_effective_params,
     notify_no_audio,
-    vessel_owns_message,
 )
 from tools._loaded.speak.text_cleaner import clean_text_for_tts
 
@@ -59,24 +58,6 @@ def on_persona_speak(
             persona_id,
         )
         return
-    if not params.get("auto_speak", True):
-        LOGGER.debug(
-            "voice-tts speak_hook skipped: auto_speak=false (persona=%s)",
-            persona_id,
-        )
-        # 自動発話を切っている回も、締めの合図のときだけ「この吹き出しに音声は
-        # 無い」を知らせる。知らせないと画面の音声ボタンが合図を待って回り続ける
-        # (手動の再生成で後から音声が作られたら、そちらが優先して表示される)。
-        # 仮想身体が引き受けた発話は、吹き出しの結末を finish_message (または
-        # 期限切れ) が一度だけ知らせるので、ここでは重ねない。
-        if _kwargs.get("is_final", True) and not vessel_owns_message(message_id):
-            notify_no_audio(
-                message_id,
-                "auto_speak is off for this persona",
-                pulse_id=_kwargs.get("pulse_id"),
-            )
-        return
-
     # pulse_id を audio_ready event payload まで引き渡す経路 (Phase 2 設計)。
     # subscriber 側 (frontend / stackchan) が同 pulse / 別 pulse の判定で
     # queue 末尾積み or 旧再生 preempt を切り替えるのに使う。
@@ -87,6 +68,9 @@ def on_persona_speak(
     # 吹き出しの声は finish_message が付ける (付けられなければ
     # notify_no_audio も finish_message 側が出す)。判定は message_id ごとに
     # 最初の断片で一度だけ決まり、以降の断片 (締めの合図を含む) も同じ扱い。
+    # auto_speak の確認より先に決める: 引き受けた発話の吹き出しの結末は
+    # auto_speak OFF でも finish_message が一度だけ知らせるので、二つのフックの
+    # 実行順に依らず「音声なし」が重ならない。
     if claim_message_voice(
         persona_id, _kwargs.get("building_id"), message_id, pulse_id=pulse_id,
     ):
@@ -95,6 +79,22 @@ def on_persona_speak(
             "(persona=%s msg=%s is_final=%s)",
             persona_id, message_id, _kwargs.get("is_final", True),
         )
+        return
+
+    if not params.get("auto_speak", True):
+        LOGGER.debug(
+            "voice-tts speak_hook skipped: auto_speak=false (persona=%s)",
+            persona_id,
+        )
+        # 自動発話を切っている回も、締めの合図のときだけ「この吹き出しに音声は
+        # 無い」を知らせる。知らせないと画面の音声ボタンが合図を待って回り続ける
+        # (手動の再生成で後から音声が作られたら、そちらが優先して表示される)。
+        if _kwargs.get("is_final", True):
+            notify_no_audio(
+                message_id,
+                "auto_speak is off for this persona",
+                pulse_id=pulse_id,
+            )
         return
 
     # Pipeline Streaming (Phase 2-α): sea runtime が文区切りごとに sub-speak

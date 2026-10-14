@@ -227,12 +227,29 @@ class SpeakHookClaimTests(_VesselTestBase):
         self.speak("こんにちは")
         self.enqueue.assert_called_once()
 
-    def test_auto_speak_off_keeps_its_own_notice_before_any_claim(self):
+    def test_auto_speak_off_unclaimed_message_keeps_its_own_notice(self):
+        self.claimed = False
         self.params["auto_speak"] = False
         self.speak("", is_final=True)
         self.enqueue.assert_not_called()
-        self.assertEqual(self.claim_calls, [])
+        self.assertEqual(self.claim_calls, [("p1", "room")])
         self.assertEqual(self.metadata_keys(), ["unavailable_keys"])
+
+    def test_auto_speak_off_claimed_single_final_is_told_once_in_either_hook_order(self):
+        """自動発話 OFF の単発の発話で、どちらのフックが先に走っても「音声なし」は一度だけ。"""
+        self.params["auto_speak"] = False
+        for order, message_id in ((("hook", "vessel"), "msg-a"), (("vessel", "hook"), "msg-b")):
+            for who in order:
+                if who == "hook":
+                    self.speak("内緒。", message_id=message_id, is_final=True)
+                else:
+                    self.assertTrue(pw.claim_message_voice("p1", "room", message_id))
+                    with self.assertRaises(pw.VoiceUnavailable):
+                        pw.synthesize_piece("p1", "内緒。", message_id=message_id, timeout=5)
+                    pw.finish_message(message_id, complete=True)
+        self.enqueue.assert_not_called()
+        self.assertEqual([e["message_id"] for e in self.events], ["msg-a", "msg-b"])
+        self.assertEqual(self.event_names(), ["audio_unavailable", "audio_unavailable"])
 
 
 class ClaimRegistryTests(_VesselTestBase):

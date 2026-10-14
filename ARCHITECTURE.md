@@ -402,16 +402,19 @@ message_id ごとの記録は `_vessel_messages` 一つにだけ持ち、`state`
 | `open` | 判定が真。吹き出しの結末はこちらが持つ | 切れ端を依頼順に取っておく | `closed` にして結末を一度だけ知らせる |
 | `closed` | 締めか期限切れで閉じた | 声を返すだけ | 何もしない |
 
-- `open` のまま 600 秒 (`_VESSEL_MESSAGE_TTL_SEC`) 触られない発話は `closed` にして
-  `notify_no_audio` する。API が呼ばれなくても効くよう、`open` の記録がある間だけ
+- `open` のまま 1 時間 (`_VESSEL_MESSAGE_TTL_SEC`) 触られない発話は `closed` にして
+  `notify_no_audio` する。アドオンが締めを送れなくなったとき (途中で無効化・落ちた) の
+  最後の網なので長めに取る (順番待ちが混んだ正常な発話を閉じないため。画面の待ち表示は
+  フロントが 300 秒で消す)。API が呼ばれなくても効くよう、`open` の記録がある間だけ
   見回りスレッド (`_run_vessel_sweeper`、30 秒ごと) が動く。
 - 件数が 4096 件 (`_VESSEL_MESSAGE_MAX`) を超えたら、終わってから 1 日
   (`_VESSEL_RETAIN_TERMINAL_SEC`) 以上たった `unclaimed` / `closed` だけを捨てる。
   `open` は件数では捨てない (期限切れでだけ閉じる)。終わった記録は切れ端を持たない
   小さな記録なので、目安を超えて残ってもよい。1 日残すのは、遅れて来た断片で判定が
   やり直されたり、閉じた発話が開き直されたりしないため。
-- 自動発話 OFF の「音声なし」は、仮想身体が引き受けた発話 (`vessel_owns_message`)
-  では speak_hook が出さない。結末は `finish_message` か期限切れが一度だけ知らせる。
+- speak_hook は auto_speak の確認より先に `claim_message_voice` を呼ぶ。引き受けた発話
+  では自動発話 OFF の「音声なし」を出さず、結末は `finish_message` か期限切れが一度だけ
+  知らせる (二つのフックの実行順に依らない)。
 
 ### 旧 Playbook 上書き方式 (v0.3.x まで)
 
