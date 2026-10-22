@@ -26,6 +26,8 @@ v0.6.0 から、SAIVerse の **アドオン管理 → カタログ** から導�
 
 GPT-SoVITS と Irodori-TTS のパッケージ (torch など) は、SAIVerse 本体の Python 環境ではなく、**エンジンごとの専用の Python 環境** (`~/.saiverse/addon_install/saiverse-voice-tts/envs/`) に入ります。本体のパッケージの版は変わりません。合成はその専用環境の Python の別プロセスで動きます。あとからエンジンを足したくなったら、アドオン管理の「導入済み」から同じ質問を開き直して選択肢を追加します。
 
+依存の下限を上げた版 (v0.6.1 など) へアドオン管理から更新すると、パッケージの導入がもう一度走り、下限より古いパッケージ (脆弱性の修正前の版など) が引き上げられます (下限の決め方: [docs/dependency_floors.md](docs/dependency_floors.md))。
+
 導入後の **参照音声の配置** は、アドオン管理 UI の「参照音声」からアップロードします (ローカル合成のエンジンを使う場合)。
 
 - 合成した音声 (wav) の保存先は `~/.saiverse/user_data/addon_data/saiverse-voice-tts/outputs/` です (v0.5.x までは `~/.saiverse/user_data/voice/out/`)。

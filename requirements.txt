@@ -4,17 +4,27 @@
 # requirements.lock を constraints にして)。ローカル合成エンジンのパッケージは
 # ここに書かない — 本体の venv と両立しないため、エンジン専用の Python 環境に入れる
 # (envs/*.txt。addon.json の setup.steps を参照)。
-numpy>=1.24
-sounddevice>=0.4.6
-soundfile>=0.12
-requests>=2.31
-huggingface_hub>=0.20
+#
+# 下限の方針: 脆弱性の修正版があるものはその修正版、それ以外は 2026-01-01 までに出た版
+# (既存の環境が既に満たしている版。docs/dependency_floors.md)。
+# numpy / requests / huggingface_hub の下限は、リリース済みの SAIVerse の
+# requirements.lock の版以下にする (本体の lock が constraints として渡るので、上回ると
+# 導入が失敗する)。lock を持つ v0.3.4 以降の全リリースで、lock の版は numpy 2.4.6
+# (Python 3.11) / 2.5.2、requests 2.34.2、huggingface-hub 0.36.2。
+# 下限を上げたら addon.json の setup_version も上げる — アドオンの更新で
+# pip install -r が再実行され、下限を満たさないパッケージが引き上げられる。
+numpy>=2.0
+sounddevice>=0.5
+soundfile>=0.13
+# 2.33.0 で GHSA-gc5v-m9x4-r6x2 を修正 (2.32.0 / 2.32.4 の修正も含む)
+requests>=2.33.0
+huggingface_hub>=0.34
 # MP3 encoder for progressive streaming to clients. PyPI ships precompiled
 # wheels that bundle libmp3lame so no system library installation is required.
 # Used to encode PCM chunks into MP3 frames on the fly for the
 # /audio/{message_id}/stream endpoint (browsers reject progressive WAV with
 # 0xFFFFFFFF header on iOS Safari / some Chromes).
-lameenc>=1.5
+lameenc>=1.8
 # torchcodec (Irodori-TTS の torchaudio.load の backend) は v0.6.0 で
 # envs/irodori-*.txt へ移した。Irodori-TTS は専用環境の子プロセスで動く。
 
