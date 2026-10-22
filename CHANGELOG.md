@@ -4,6 +4,28 @@
 
 ## [Unreleased] — 別の PC の GPU で声を作る
 
+### Python の依存に下限を書き、脆弱性の修正版を届ける
+
+- `requirements.txt` と `envs/*.txt` の、PyPI から入るパッケージの全行に下限を書いた。
+  これまでは多くの行に版の指定が無く、利用者の環境には導入した日の最新版が入ったまま
+  上がらなかった。
+- 脆弱性の修正版を下限にした: certifi 2026.10.19 (emSign のルート証明書の除去)、
+  aiohttp 3.14.4、requests 2.33.0 (本体の venv)、GPT-SoVITS の環境では
+  pillow 13.0.0・protobuf 6.33.5・nltk 3.10.4、Irodori-TTS の環境では protobuf 4.25.8。
+  certifi・pillow・aiohttp・protobuf は依存として入るパッケージなので、直接の行として
+  足した。それ以外のパッケージは 2026-01-01 までに出た版を下限にし、既存の環境では
+  動かない。
+- Irodori-TTS の環境の descript-audiotools (dacvae の依存) を、PyPI の 0.7.2 から
+  GitHub の 0.7.4 (commit 固定) に替えた。0.7.2 は protobuf<3.20 を要求し、
+  protobuf の修正版と両立しない。
+- `addon.json` の `setup_version` を 3 に、`version` を 0.6.1 に上げた。既存の利用者が
+  アドオンを更新すると `setup.steps` が再実行され、下限を満たさないパッケージが
+  引き上げられる。
+- 下限で直せない脆弱性 (GPT-SoVITS の環境の transformers、Irodori-TTS の環境の
+  pillow と protobuf の一部など) と、その理由は `docs/dependency_floors.md` に書いた。
+- `tests/test_dependency_floors.py` を足した。全行に下限があることと、脆弱性の
+  修正版の下限が下げられていないことを確かめる。
+
 ### 仮想身体の部屋では、声を VR のアバターからだけ鳴らす
 
 - Godot Vessel アドオンが「この発話の声は仮想身体が引き受ける」判定を登録できる

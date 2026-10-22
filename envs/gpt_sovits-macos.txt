@@ -3,7 +3,7 @@
 #
 # アドオンカタログの導入で、addon.json の setup.steps の pip_install
 # (env: gpt_sovits, os: macos) がこのファイルを入れる。中身は gpt_sovits-cuda.txt と
-# 同じ考え方で (変えたところの理由はそちらの先頭を参照)、違いは二つだけ:
+# 同じ考え方で (変えたところの理由と下限の方針はそちらの先頭を参照)、違いは二つだけ:
 #   - torch / torchaudio は PyPI の普通の版 (Mac の GPU (MPS) と CPU で動く)
 #   - onnxruntime-gpu は Mac 向けが無いので、普通の onnxruntime を入れる
 # (python_mecab_ko の行は cuda 側の「win32 以外」の条件を外して無条件にしてあるが、
@@ -14,49 +14,60 @@
 torch==2.11.0
 torchaudio==2.11.0
 
-opencc-python-reimplemented
-nltk
-huggingface_hub>=0.20
+opencc-python-reimplemented>=0.1.7
+# 3.10.3 で GHSA-m4rf-3fr8-xwx3 ほかを修正。GHSA-8mgp-746c-j5xp の影響範囲は 3.10.3 まで
+# (g2p_en / g2pk2 も nltk を使う。3.10.4 での英語の g2p は隔離の通し確認 2026-10-22 で確認)
+nltk>=3.10.4
+huggingface_hub>=0.34
+# 以下 4 行は依存として入るパッケージ。脆弱性の修正版を下限にするために直接書く
+# certifi (requests / httpx が使う): 2026.10.19 で emSign のルート証明書を除去 (GHSA-6q48-6c7w-9gw2)
+certifi>=2026.10.19
+# pillow (matplotlib / tensorboard が使う): 13.0.0 で CVE-2026-112403 ほかを修正
+pillow>=13.0.0
+# aiohttp (pytorch-lightning が fsspec[http] 経由で使う): 3.14.4 で GHSA-2g87-pp6c-29x5 ほかを修正
+aiohttp>=3.14.4
+# protobuf (tensorboard / onnxruntime が使う): 6.33.5 で CVE-2025-4565 と CVE-2026-0994 を修正
+protobuf>=6.33.5
 # 推論の import 連鎖が matplotlib を読む (gpt_sovits-cuda.txt の注記を参照)
-matplotlib
+matplotlib>=3.10
 
-numpy
-scipy
-tensorboard
+numpy>=2.1
+scipy>=1.15
+tensorboard>=2.20
 librosa==0.10.2
-numba
+numba>=0.61
 pytorch-lightning>=2.4
-ffmpeg-python
-onnxruntime
-tqdm
+ffmpeg-python>=0.2.0
+onnxruntime>=1.20
+tqdm>=4.67
 funasr==1.0.27
-cn2an
-pypinyin
+cn2an>=0.5.22
+pypinyin>=0.53
 pyopenjtalk>=0.4.1
-g2p_en
-modelscope
-sentencepiece
+g2p_en>=2.1.0
+modelscope>=1.20
+sentencepiece>=0.2.1
 transformers>=4.43,<=4.50
-peft<0.18.0
-chardet
-PyYAML
-psutil
+peft>=0.17,<0.18.0
+chardet>=5.2
+PyYAML>=6.0.2
+psutil>=6.1
 # jieba_fast は PyPI に wheel が無く (sdist だけ)、C コンパイラの無い環境では
 # 入らない。同梱の中継パッケージが、純 Python の jieba を jieba_fast の名前で
 # 提供する (shims/jieba_fast_shim/ を参照)
 ./shims/jieba_fast_shim
-jieba
-split-lang
+jieba>=0.42.1
+split-lang>=2.1
 fast_langdetect>=0.3.1
-wordsegment
-rotary_embedding_torch
-ToJyutping
-g2pk2
-ko_pron
-python_mecab_ko
+wordsegment>=1.3.1
+rotary_embedding_torch>=0.8
+ToJyutping>=3.2.0
+g2pk2>=0.0.3
+ko_pron>=1.3
+python_mecab_ko>=1.3
 fastapi[standard]>=0.115.2
-x_transformers
+x_transformers>=2.0
 torchmetrics>=1.5.2,<1.6
-pydantic<=2.10.6
+pydantic>=2.10,<=2.10.6
 ctranslate2>=4.0,<5
 av>=11

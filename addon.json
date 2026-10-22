@@ -8,9 +8,9 @@
         "ja": "GPT-SoVITS / Irodori-TTS / OpenAI TTS / ElevenLabs によるペルソナ発話の音声合成と再生。GPU が無い環境でもクラウド API 経由で利用可能。バックエンドPCのスピーカーとブラウザの両方に配信可能。",
         "en": "Speech synthesis and playback for personas via GPT-SoVITS, Irodori-TTS, OpenAI TTS, and ElevenLabs. Works via cloud APIs on systems without GPUs. Streams to both backend PC speakers and web browsers."
     },
-    "version": "0.6.0",
+    "version": "0.6.1",
     "manifest_version": 2,
-    "setup_version": 2,
+    "setup_version": 3,
     "data_subdirs": {
         "inputs": "参照音声",
         "outputs": "合成した音声"

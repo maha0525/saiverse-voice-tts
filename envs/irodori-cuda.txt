@@ -8,6 +8,12 @@
 # Irodori-TTS 自身の依存 (transformers>=5、peft>=0.18、gradio>=5 等) は、その
 # pyproject.toml から入る。GPT-SoVITS とも本体の venv とも両立しないので、専用環境に入れる。
 #
+# 下限の方針: 脆弱性の修正版があるパッケージはその修正版を下限にし、それ以外は
+# 2026-01-01 までに出た版 (既存の環境が既に満たしている版) を下限にする。下限を
+# 上げたら addon.json の setup_version も上げる — アドオンの更新で pip install -r が
+# 再実行され、下限を満たさないパッケージが引き上げられる。Irodori-TTS 自身の依存の
+# 下限は、その pyproject.toml が持つ。
+#
 # torch / torchaudio は CUDA 12.8 版に固定 (本体 venv で合成実績のある組)。
 # Irodori-TTS の pyproject.toml は torchcodec を <0.11 に縛っている (torchcodec 0.10 は
 # torch 2.10 向け)。torch 2.11 の torchaudio.load が torchcodec を読めないときは、
@@ -20,11 +26,28 @@ torchaudio==2.11.0+cu128
 # 入手先 (GitHub) は uv 専用の欄 ([tool.uv.sources]) にある。pip はその欄を
 # 読まないので、ここで入手先を commit 固定で与える (隔離の通し確認で発見)
 dacvae @ git+https://github.com/facebookresearch/dacvae@414c20785fc3a28373073ea8ef7a1316eeeaca6e
+# dacvae は descript-audiotools>=0.7.2 を要求する。PyPI の最新 (0.7.2) は
+# protobuf<3.20 を要求し、protobuf の脆弱性の修正版 (4.25.8 以降) と両立しない。
+# GitHub の 0.7.4 (tag の commit) は protobuf<5.0.0 まで許すので、入手先を commit 固定で与える
+descript-audiotools @ git+https://github.com/descriptinc/audiotools@ffe03e96b4d2dfb3ddecad289a6a95a7e96cc8c6
 ./external/Irodori-TTS
+# 以下 4 行は依存として入るパッケージ。脆弱性の修正版を下限にするために直接書く
+# certifi (requests / httpx が使う): 2026.10.19 で emSign のルート証明書を除去 (GHSA-6q48-6c7w-9gw2)
+certifi>=2026.10.19
+# protobuf (descript-audiotools / tensorboard / wandb が使う): 4.25.8 で CVE-2025-4565 を修正。
+# CVE-2026-0994 の修正版は 5.29.6 以降だが、descript-audiotools が <5.0.0 に縛るので
+# 入れられない (docs/dependency_floors.md)
+protobuf>=4.25.8
+# pillow (gradio / matplotlib / tensorboard が使う): CVE-2026-112403 ほかの修正版は 13.0.0
+# だが、gradio (Irodori-TTS の依存) が pillow<13.0 に縛るので入れられない。12.3.0 は
+# 既存の環境の版 (docs/dependency_floors.md)
+pillow>=12.3.0
+# aiohttp (datasets が fsspec[http] 経由で使う): 3.14.4 で GHSA-2g87-pp6c-29x5 ほかを修正
+aiohttp>=3.14.4
 # torchaudio.load の backend (torch 2.10 以降の torchaudio が要求する)
 torchcodec>=0.10
 # torchcodec が読めないとき、Irodori の _load_audio が soundfile に切り替える。
 # その切り替え先を暗黙依存にしない
 soundfile>=0.12
-numpy
-huggingface_hub>=0.20
+numpy>=2.1
+huggingface_hub>=0.34
