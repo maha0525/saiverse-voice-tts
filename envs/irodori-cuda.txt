@@ -31,7 +31,7 @@ dacvae @ git+https://github.com/facebookresearch/dacvae@414c20785fc3a28373073ea8
 # GitHub の 0.7.4 (tag の commit) は protobuf<5.0.0 まで許すので、入手先を commit 固定で与える
 descript-audiotools @ git+https://github.com/descriptinc/audiotools@ffe03e96b4d2dfb3ddecad289a6a95a7e96cc8c6
 ./external/Irodori-TTS
-# 以下 4 行は依存として入るパッケージ。脆弱性の修正版を下限にするために直接書く
+# 以下 5 行は依存として入るパッケージ。脆弱性の修正版を下限にするために直接書く
 # certifi (requests / httpx が使う): 2026.10.19 で emSign のルート証明書を除去 (GHSA-6q48-6c7w-9gw2)
 certifi>=2026.10.19
 # protobuf (descript-audiotools / tensorboard / wandb が使う): 4.25.8 で CVE-2025-4565 を修正。
@@ -44,6 +44,9 @@ protobuf>=4.25.8
 pillow>=12.3.0
 # aiohttp (datasets が fsspec[http] 経由で使う): 3.14.4 で GHSA-2g87-pp6c-29x5 ほかを修正
 aiohttp>=3.14.4
+# brotli (gradio の依存。入っていると urllib3 / httpx / aiohttp が Brotli で圧縮された
+# 応答を自動で展開する): 1.2.1 で CVE-2026-111497 (展開の処理の範囲外書き込み) を修正
+brotli>=1.2.1
 # torchaudio.load の backend (torch 2.10 以降の torchaudio が要求する)
 torchcodec>=0.10
 # torchcodec が読めないとき、Irodori の _load_audio が soundfile に切り替える。

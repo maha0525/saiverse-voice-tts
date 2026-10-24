@@ -1,7 +1,7 @@
 """requirements.txt と envs/*.txt の下限のテスト。
 
 - PyPI から入るパッケージの行は、すべて下限 (>= か ==) を持つ
-- 脆弱性の修正版を下限にしたパッケージ (certifi / aiohttp / pillow / protobuf / nltk) が
+- 脆弱性の修正版を下限にしたパッケージ (certifi / aiohttp / pillow / protobuf / nltk / brotli) が
   下限を下げられていない
 - 同じエンジンの cuda 用と macOS 用のファイルで、同じパッケージの下限が揃っている
 """
@@ -79,12 +79,14 @@ _SECURITY_FLOORS = {
         "pillow": "12.3.0",
         "aiohttp": "3.14.4",
         "protobuf": "4.25.8",
+        "brotli": "1.2.1",
     },
     "irodori-macos.txt": {
         "certifi": "2026.10.19",
         "pillow": "12.3.0",
         "aiohttp": "3.14.4",
         "protobuf": "4.25.8",
+        "brotli": "1.2.1",
     },
 }
 

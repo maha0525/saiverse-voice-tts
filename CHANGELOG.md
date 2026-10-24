@@ -4,6 +4,16 @@
 
 ## [Unreleased] — 別の PC の GPU で声を作る
 
+### Irodori-TTS の環境の brotli を修正版に上げる
+
+- Irodori-TTS の環境に gradio の依存として入る brotli に、CVE-2026-111497 (Brotli の
+  展開の処理の範囲外書き込み、1.0.3〜1.2.0) がある。brotli が入っていると、その環境の
+  urllib3 / httpx / aiohttp は Brotli で圧縮された応答を自動で展開する。
+  `envs/irodori-*.txt` に `brotli>=1.2.1` を直接の行として足した。
+- GPT-SoVITS の環境と本体の venv には brotli が入らないので、行を足していない。
+- `addon.json` の `setup_version` を 4 に、`version` を 0.6.2 に上げた。既存の利用者が
+  アドオンを更新すると `setup.steps` が再実行され、brotli が 1.2.1 に引き上げられる。
+
 ### Python の依存に下限を書き、脆弱性の修正版を届ける
 
 - `requirements.txt` と `envs/*.txt` の、PyPI から入るパッケージの全行に下限を書いた。
