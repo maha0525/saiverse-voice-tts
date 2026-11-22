@@ -175,6 +175,11 @@ class ElevenLabsEngine(TTSEngine):
                         attempt += 1
                         time.sleep(_RETRY_BASE_SLEEP * attempt)
                         continue
+                    if resp.status_code >= 400:
+                        # httpx.stream の応答は本文をまだ読んでいないので、
+                        # 読まずに raise すると下の except で resp.text が読めず、
+                        # ElevenLabs が返した理由 (402 の中身など) がログに残らない。
+                        resp.read()
                     resp.raise_for_status()
                     for chunk in resp.iter_bytes():
                         if chunk:
@@ -184,9 +189,9 @@ class ElevenLabsEngine(TTSEngine):
                 status = exc.response.status_code
                 detail = ""
                 try:
-                    detail = exc.response.text[:300]
-                except Exception:  # pragma: no cover
-                    pass
+                    detail = exc.response.text[:500]
+                except Exception as read_exc:  # pragma: no cover
+                    detail = f"(response body unavailable: {read_exc})"
                 LOGGER.error(
                     "elevenlabs: API error HTTP %d voice_id=%s: %s",
                     status, voice_id, detail,

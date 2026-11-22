@@ -48,10 +48,14 @@ def _uninstall_fake_addon_config() -> None:
 
 
 class _FakeStreamResponse:
+    """httpx.stream の応答の代わり。本物と同じく、``read()`` を呼ぶまで本文は
+    読めない (例外に付いた response の ``.text`` は ResponseNotRead になる)。"""
+
     def __init__(self, status_code: int, chunks: List[bytes], text: str = ""):
         self.status_code = status_code
         self._chunks = chunks
-        self.text = text
+        self._text = text
+        self._read = False
 
     def __enter__(self):
         return self
@@ -59,11 +63,21 @@ class _FakeStreamResponse:
     def __exit__(self, *args):
         return False
 
+    def read(self) -> bytes:
+        self._read = True
+        return self._text.encode("utf-8")
+
     def raise_for_status(self):
         if self.status_code >= 400:
             import httpx
             req = httpx.Request("POST", "https://api.elevenlabs.io/v1/text-to-speech/x/stream")
-            resp = httpx.Response(self.status_code, request=req, text=self.text)
+            if self._read:
+                resp = httpx.Response(self.status_code, request=req, text=self._text)
+            else:
+                resp = httpx.Response(
+                    self.status_code, request=req,
+                    stream=httpx.ByteStream(self._text.encode("utf-8")),
+                )
             raise httpx.HTTPStatusError(
                 f"HTTP {self.status_code}", request=req, response=resp,
             )
@@ -252,6 +266,16 @@ class ElevenLabsSynthesizeTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 list(eng.synthesize_stream("hi", params={"voice_id": "x"}))
         self.assertEqual(mock_stream.call_count, 1)
+
+    def test_4xx_logs_the_reason_elevenlabs_returned(self):
+        reason = '{"detail":{"code":"paid_plan_required","message":"Free users cannot use library voices via the API."}}'
+        fake_resp = _FakeStreamResponse(402, [], text=reason)
+        eng = self.mod.ElevenLabsEngine({})
+        with patch("httpx.stream", return_value=fake_resp):
+            with self.assertLogs(self.mod.LOGGER, level="ERROR") as logs:
+                with self.assertRaises(Exception):
+                    list(eng.synthesize_stream("hi", params={"voice_id": "x"}))
+        self.assertTrue(any("paid_plan_required" in line for line in logs.output))
 
     def test_5xx_retries_once(self):
         first = _FakeStreamResponse(503, [], text="busy")
