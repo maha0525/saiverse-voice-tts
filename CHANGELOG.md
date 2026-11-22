@@ -4,6 +4,20 @@
 
 ## [Unreleased] — 別の PC の GPU で声を作る
 
+### ElevenLabs の読み上げモデルをペルソナごとに選ぶ
+
+- ペルソナ別設定に「ElevenLabs モデル」(`elevenlabs_model`) を足した。選べるのは
+  `eleven_flash_v2_5` (既定) / `eleven_multilingual_v2` / `eleven_v3` / `eleven_v4` /
+  `eleven_turbo_v2_5`。これまでは `eleven_turbo_v2_5` に固定で、ElevenLabs のサイトで
+  選んだモデルは SAIVerse からの合成に効かなかった。
+- 既定を `eleven_turbo_v2_5` から `eleven_flash_v2_5` に変えた。ElevenLabs は turbo を
+  非推奨にし、flash を「機能的に同等」な後継として案内している。
+- `eleven_v4` には `voice_settings` の `stability` と `similarity_boost` だけを送る
+  (v4 には Style が無い)。
+- `registry.json` の `params.model_id` は従来どおり使え、UI の値より優先する。
+- `addon.json` の `version` を 0.6.3 に上げた。導入の手順は変わらないので、
+  `setup_version` は上げていない。
+
 ### Irodori-TTS の環境の brotli を修正版に上げる
 
 - Irodori-TTS の環境に gradio の依存として入る brotli に、CVE-2026-111497 (Brotli の

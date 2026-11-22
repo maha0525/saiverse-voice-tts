@@ -103,7 +103,7 @@ class ElevenLabsRequestBuildTests(unittest.TestCase):
     def test_default_body(self):
         body = self.eng._build_request_body("hello", None)
         self.assertEqual(body["text"], "hello")
-        self.assertEqual(body["model_id"], "eleven_turbo_v2_5")
+        self.assertEqual(body["model_id"], "eleven_flash_v2_5")
         self.assertIn("voice_settings", body)
         self.assertEqual(body["voice_settings"]["stability"], 0.5)
         self.assertEqual(body["voice_settings"]["similarity_boost"], 0.75)
@@ -133,6 +133,37 @@ class ElevenLabsRequestBuildTests(unittest.TestCase):
             "x", {"model_id": "eleven_multilingual_v2"}
         )
         self.assertEqual(body["model_id"], "eleven_multilingual_v2")
+
+    def test_model_from_ui_param(self):
+        body = self.eng._build_request_body("x", {"elevenlabs_model": "eleven_v3"})
+        self.assertEqual(body["model_id"], "eleven_v3")
+
+    def test_model_id_wins_over_ui_param(self):
+        body = self.eng._build_request_body(
+            "x", {"model_id": "eleven_multilingual_v2", "elevenlabs_model": "eleven_v3"}
+        )
+        self.assertEqual(body["model_id"], "eleven_multilingual_v2")
+
+    def test_blank_ui_param_falls_back_to_default(self):
+        body = self.eng._build_request_body("x", {"elevenlabs_model": "  "})
+        self.assertEqual(body["model_id"], "eleven_flash_v2_5")
+
+    def test_v4_sends_only_stability_and_similarity(self):
+        body = self.eng._build_request_body(
+            "x", {"elevenlabs_model": "eleven_v4", "stability": 0.3, "style": 0.4}
+        )
+        self.assertEqual(body["model_id"], "eleven_v4")
+        self.assertEqual(
+            body["voice_settings"], {"stability": 0.3, "similarity_boost": 0.75}
+        )
+
+    def test_manifest_default_matches_engine_default(self):
+        import json
+        manifest = json.loads((Path(__file__).resolve().parent.parent / "addon.json").read_text(encoding="utf-8"))
+        param = next(p for p in manifest["params_schema"] if p["key"] == "elevenlabs_model")
+        self.assertEqual(param["default"], self.mod._DEFAULT_MODEL_ID)
+        self.assertIn(self.mod._DEFAULT_MODEL_ID, param["options"])
+        self.assertTrue(param["persona_configurable"])
 
     def test_stream_url_format(self):
         url = self.eng._stream_url("abc123", "pcm_24000")

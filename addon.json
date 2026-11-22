@@ -8,7 +8,7 @@
         "ja": "GPT-SoVITS / Irodori-TTS / OpenAI TTS / ElevenLabs によるペルソナ発話の音声合成と再生。GPU が無い環境でもクラウド API 経由で利用可能。バックエンドPCのスピーカーとブラウザの両方に配信可能。",
         "en": "Speech synthesis and playback for personas via GPT-SoVITS, Irodori-TTS, OpenAI TTS, and ElevenLabs. Works via cloud APIs on systems without GPUs. Streams to both backend PC speakers and web browsers."
     },
-    "version": "0.6.2",
+    "version": "0.6.3",
     "manifest_version": 2,
     "setup_version": 4,
     "data_subdirs": {
@@ -175,6 +175,15 @@
             "description": "ElevenLabs ダッシュボード (Voice Lab → Instant Voice Cloning) で作成したボイスの ID を貼り付け。エンジンが elevenlabs のときのみ使用される。",
             "type": "text",
             "placeholder": "例: 21m00Tcm4TlvDq8ikWAM",
+            "persona_configurable": true
+        },
+        {
+            "key": "elevenlabs_model",
+            "label": "ElevenLabs モデル",
+            "description": "ElevenLabs で読み上げに使うモデル。ElevenLabs のサイトで選んだモデルは SAIVerse からの合成には効かないので、ここで選ぶ。eleven_flash_v2_5 は速くて安い (旧既定の eleven_turbo_v2_5 と同等。turbo は ElevenLabs が非推奨にした)。eleven_multilingual_v2 / eleven_v3 / eleven_v4 は表現が豊かなモデル。料金と速さは ElevenLabs の料金ページで確認してください。合成に失敗したときは、ElevenLabs が返した理由がバックエンドのログに出ます。エンジンが elevenlabs のときのみ使用される。",
+            "type": "dropdown",
+            "default": "eleven_flash_v2_5",
+            "options": ["eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_v3", "eleven_v4", "eleven_turbo_v2_5"],
             "persona_configurable": true
         },
         {

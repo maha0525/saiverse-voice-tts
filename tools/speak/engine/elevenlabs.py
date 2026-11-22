@@ -32,7 +32,13 @@ LOGGER = logging.getLogger(__name__)
 
 _API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
 _PCM_SAMPLE_RATE = 24_000  # output_format=pcm_24000 と一致
-_DEFAULT_MODEL_ID = "eleven_turbo_v2_5"
+# eleven_turbo_v2_5 は ElevenLabs が非推奨にした (公式の Models ページ、
+# 2026-11-23 確認)。後継として案内されている eleven_flash_v2_5 は
+# 「機能的に同等」とされ、料金も同じ。
+_DEFAULT_MODEL_ID = "eleven_flash_v2_5"
+# Eleven v4 は Stability と Similarity だけを使い、Style のスライダーが無い
+# (公式の Eleven v4 ページ)。v4 系には voice_settings をこの二つだけ送る。
+_V4_VOICE_SETTING_KEYS = ("stability", "similarity_boost")
 _DEFAULT_OUTPUT_FORMAT = "pcm_24000"
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _MAX_RETRIES = 1
@@ -88,6 +94,17 @@ class ElevenLabsEngine(TTSEngine):
         return None
 
     @staticmethod
+    def _resolve_model_id(params: Optional[Dict[str, Any]]) -> str:
+        params = params or {}
+        # 優先順位: profile.params.model_id (registry.json に直接書く場合)
+        # → profile.params.elevenlabs_model (addon UI のペルソナ別設定) → 既定
+        for key in ("model_id", "elevenlabs_model"):
+            v = params.get(key)
+            if v and str(v).strip():
+                return str(v).strip()
+        return _DEFAULT_MODEL_ID
+
+    @staticmethod
     def _build_voice_settings(params: Dict[str, Any]) -> Dict[str, Any]:
         settings = dict(_DEFAULT_VOICE_SETTINGS)
         for k in ("stability", "similarity_boost", "style"):
@@ -108,10 +125,16 @@ class ElevenLabsEngine(TTSEngine):
         params: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         params = params or {}
+        model_id = self._resolve_model_id(params)
+        voice_settings = self._build_voice_settings(params)
+        if model_id.startswith("eleven_v4"):
+            voice_settings = {
+                k: voice_settings[k] for k in _V4_VOICE_SETTING_KEYS
+            }
         body: Dict[str, Any] = {
             "text": text,
-            "model_id": str(params.get("model_id") or _DEFAULT_MODEL_ID),
-            "voice_settings": self._build_voice_settings(params),
+            "model_id": model_id,
+            "voice_settings": voice_settings,
         }
         return body
 
