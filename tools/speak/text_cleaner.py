@@ -24,12 +24,23 @@ _MULTI_BLANK = re.compile(r"\n{3,}")
 # 身体への合図なので声に出さない。値が未知・壊れていても記法ごと消す
 # (アドオン側 body_emotes.py の _MARKER と同じ形)。
 _BODY_EMOTE = re.compile(r'\{\s*"body_emote"\s*:\s*(?:"(?:\\.|[^"\\])*"|[^{}]*?)\s*\}')
+# SAIVerse 本体の画面にだけ見せる囲み。スペル・Playbook 起動の呼び出しと結果が
+# ``<user_only alt="Playbook 起動">/spell ...<details class="spellResult">...</details></user_only>``
+# の形で吹き出しの文に入っている。本体は通常の発話では ``strip_user_only``
+# (saiverse/content_tags.py) で取り除いてから渡すが、吹き出しの文をそのまま
+# 受け取る入口 (再生成ボタン・記録からの引き当て) では残っているので、ここで
+# 囲みごと消す。``<in_heart>`` (ペルソナの心の中) も声に出さない。
+# 正規表現は本体の content_tags.py の _USER_ONLY_RE / _IN_HEART_RE と同じ形。
+_USER_ONLY = re.compile(r"<user_only(?:\s[^>]*)?>.*?</user_only>", re.DOTALL)
+_IN_HEART = re.compile(r"<in_heart>.*?</in_heart>", re.DOTALL)
 
 
 def clean_text_for_tts(text: str) -> str:
     if not text:
         return ""
-    t = _BODY_EMOTE.sub("", text)
+    t = _USER_ONLY.sub("", text)
+    t = _IN_HEART.sub("", t)
+    t = _BODY_EMOTE.sub("", t)
     t = _MD_IMAGE.sub("", t)
     t = _MD_LINK.sub(r"\1", t)
     t = _MD_REF_LINK.sub(r"\1", t)
