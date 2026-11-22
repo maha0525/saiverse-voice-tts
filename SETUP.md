@@ -215,6 +215,9 @@ GPU を持たないユーザー向けの選択肢。**追加のソフトウェ�
    - 環境変数 `ELEVENLABS_API_KEY` を `.env` に書いてもOK
 2. ペルソナ別設定 → 「**TTS エンジン**」を `elevenlabs` に変更
 3. 「**ElevenLabs Voice ID**」に取得した voice_id を貼り付け
+4. 「**ElevenLabs モデル**」で読み上げのモデルを選ぶ (既定は `eleven_flash_v2_5`)
+   - ElevenLabs のサイトで選んだモデルは、SAIVerse からの合成には効きません。ここで選んだモデルが使われます
+   - `eleven_v3` / `eleven_v4` などで合成に失敗したときは、ElevenLabs が返した理由がバックエンドのログ (`elevenlabs: API error HTTP ...`) に出ます
 
 #### 4. 料金目安 (2026 年 5 月時点、最新は [ElevenLabs Pricing](https://elevenlabs.io/pricing) を参照)
 
@@ -225,15 +228,15 @@ GPU を持たないユーザー向けの選択肢。**追加のソフトウェ�
 | **Creator** | $22 | 100,000 | 30 (IVC + PVC) | 可 |
 | **Pro** | $99 | 500,000 | 160 | 可 |
 
-クレジット消費レート (パック既定 `eleven_turbo_v2_5` の場合):
+クレジット消費レート (既定の `eleven_flash_v2_5` の場合):
 
-| プラン | 月の合成可能文字数 (turbo) | 100 文字発話に換算 |
+| プラン | 月の合成可能文字数 (flash) | 100 文字発話に換算 |
 |---|---|---|
 | Free | 約 20,000 文字 | 約 200 発話 |
 | Starter | 約 60,000 文字 | 約 600 発話 |
 | Creator | 約 200,000 文字 | 約 2,000 発話 |
 
-> モデル別 credit レート: `eleven_turbo_v2_5` (既定) と `eleven_flash_v2_5` は **0.5 credit/char**、`eleven_multilingual_v2` は **1 credit/char**。
+> モデル別 credit レート: `eleven_flash_v2_5` (既定) と `eleven_turbo_v2_5` は **0.5 credit/char**、`eleven_multilingual_v2` は **1 credit/char**。`eleven_v3` / `eleven_v4` のレートは [ElevenLabs Pricing](https://elevenlabs.io/pricing) を参照。
 > 月初リセット、未使用分は失効。
 
 ### 既存ペルソナのエンジン切替
