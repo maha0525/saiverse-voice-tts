@@ -279,6 +279,34 @@ def _notify_audio_ready(
     )
 
 
+class _RequestRefused(Exception):
+    """合成先が HTTP 4xx でリクエストそのものを断ったことを、一括合成への
+    作り直しをせずに呼び出し側へ伝える。"""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+# 4xx でも、時間を置けば通りうるもの (408 のタイムアウト、429 の回数制限) は
+# 断りとして扱わず、従来どおり一括合成で作り直す。
+_RETRYABLE_CLIENT_STATUS = {408, 429}
+
+
+def _is_refused_request(exc: BaseException) -> bool:
+    """合成先の HTTP 応答が、同じリクエストを送り直しても通らない 4xx か。
+
+    エンジンごとの例外の型には依存せず、``exc.response.status_code`` を見る
+    (httpx / requests の HTTP エラーはどちらもこの形)。
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return (
+        isinstance(status, int)
+        and 400 <= status < 500
+        and status not in _RETRYABLE_CLIENT_STATUS
+    )
+
+
 def notify_no_audio(
     message_id: Optional[str],
     reason: str,
@@ -629,7 +657,10 @@ class _TTSWorker:
         sub_seq=1 + is_final=True, which is the same effective shape).
 
         Returns True on success, False if streaming fell through and caller
-        should use the non-streaming fallback.
+        should use the non-streaming fallback. Raises ``_RequestRefused``
+        when the engine's HTTP endpoint refused the request itself (4xx other
+        than 408/429) before any audio was produced; the non-streaming
+        fallback would send the same request, so the caller must not retry.
         """
         sd = None
         if server_side_playback:
@@ -761,8 +792,13 @@ class _TTSWorker:
                 exc, message_id, sub_seq,
             )
             if len(state.collected) == collected_before:
-                # まだ一片も流していない: 呼び出し側が一括合成で作り直す
                 self._teardown_message_state(state, message_id)
+                if _is_refused_request(exc):
+                    # 合成先がこのリクエストそのものを断った (402 の有料プラン
+                    # 限定の声、401 の鍵の誤り、422 の Voice ID の誤りなど)。
+                    # 一括合成も同じリクエストを送るだけなので、作り直さない。
+                    raise _RequestRefused(exc) from exc
+                # まだ一片も流していない: 呼び出し側が一括合成で作り直す
                 return False
             # この文の前半はもう鳴っている。一文丸ごと作り直すと前半がもう一度
             # 鳴るので作り直さず、流した分で文を終えて、吹き出しの続き (次の文・
@@ -1081,20 +1117,33 @@ class _TTSWorker:
         tts_text = self._apply_pronunciation(job.text, profile, job.persona_id)
 
         if use_streaming:
-            ok = self._play_streaming(
-                engine=engine,
-                text=tts_text,
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                params=synthesis_params,
-                job_id=job.job_id,
-                message_id=job.message_id,
-                server_side_playback=server_side_playback,
-                output_device=resolved_device,
-                pulse_id=job.pulse_id,
-                sub_seq=job.sub_seq,
-                is_final=job.is_final,
-            )
+            try:
+                ok = self._play_streaming(
+                    engine=engine,
+                    text=tts_text,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    params=synthesis_params,
+                    job_id=job.job_id,
+                    message_id=job.message_id,
+                    server_side_playback=server_side_playback,
+                    output_device=resolved_device,
+                    pulse_id=job.pulse_id,
+                    sub_seq=job.sub_seq,
+                    is_final=job.is_final,
+                )
+            except _RequestRefused as refused:
+                LOGGER.error(
+                    "TTS request refused (engine=%s); not retrying with "
+                    "non-streaming synthesis: %s",
+                    engine_name, refused.cause,
+                )
+                notify_no_audio(
+                    job.message_id,
+                    f"synthesis refused (engine={engine_name}): {refused.cause}",
+                    pulse_id=job.pulse_id,
+                )
+                return
             if ok:
                 return
             LOGGER.info("Streaming failed; falling back to non-streaming synthesis.")

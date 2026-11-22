@@ -250,6 +250,7 @@ GPU を持たないユーザー向けの選択肢。**追加のソフトウェ�
 - **HTTP 401**: key の typo / 期限切れ / 課金未設定 (OpenAI は最低 $5 入金しないと API 動かない)
 - **HTTP 429**: レートリミット。1 回はリトライされるが続けば backoff、しばらく待つ
 - **ElevenLabs HTTP 422**: voice_id がアカウントに存在しない、または別アカウントで作った Voice ID を貼っている
+- **ElevenLabs HTTP 402 (`paid_plan_required`)**: 無料プランでは、ボイスライブラリから追加した他の人の声を API から使えません (ElevenLabs のサイトの読み上げ画面では使えても、SAIVerse からは使えない)。自分で作った声 (Instant Voice Cloning) か、ElevenLabs が最初から用意している声を使うか、有料プランにしてください。モデルを変えても通りません
 
 ## 詳細セットアップ(手動)
 

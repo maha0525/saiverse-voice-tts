@@ -113,6 +113,42 @@ class PartialStreamFailureTests(unittest.TestCase):
         self.assertEqual(len(wavs[0]), 480)
         no_audio.assert_not_called()
 
+    def test_a_refused_request_is_not_sent_again_as_whole_sentence(self):
+        # 402 (e.g. a library voice on a free plan): the whole-sentence path
+        # would send the same request and get the same refusal.
+        engine = _RefusingEngine(status=402)
+        worker, ready, no_audio, stream, wavs = self._run(
+            engine, [{"text": "hello", "job_id": "j1"}],
+        )
+        self.assertEqual(engine.whole_sentence_calls, [])
+        self.assertEqual(wavs, [])
+        no_audio.assert_called_once()
+        self.assertIn("402", no_audio.call_args.args[1])
+        self.assertNotIn("msg", worker._message_states)
+
+    def test_a_rate_limited_request_still_falls_back_to_whole_sentence(self):
+        engine = _RefusingEngine(status=429)
+        worker, ready, no_audio, stream, wavs = self._run(
+            engine, [{"text": "hello", "job_id": "j1"}],
+        )
+        self.assertEqual(engine.whole_sentence_calls, ["hello"])
+        no_audio.assert_not_called()
+
+
+class _RefusingEngine(_BreakingEngine):
+    """The HTTP endpoint answers ``status`` before sending any audio."""
+
+    def __init__(self, status: int):
+        super().__init__(good_chunks=None)
+        self.status = status
+
+    def synthesize_stream(self, text, ref_audio=None, ref_text=None, params=None) -> Iterator[SynthesisChunk]:
+        import httpx
+        request = httpx.Request("POST", "https://api.example.invalid/stream")
+        response = httpx.Response(self.status, request=request, text='{"detail":"refused"}')
+        raise httpx.HTTPStatusError(f"{self.status}", request=request, response=response)
+        yield  # pragma: no cover - makes this a generator
+
 
 if __name__ == "__main__":
     unittest.main()
