@@ -112,6 +112,22 @@ class FilenameSanitizationTests(unittest.TestCase):
         self.assertEqual(self.api._unique_wav_filename("hello.wav", used), "hello_2.wav")
         self.assertEqual(self.api._unique_wav_filename("hello.wav", used), "hello_3.wav")
 
+    def test_sanitize_and_unique_bound_utf8_byte_length_for_multibyte_names(self):
+        jp = self.api._sanitize_wav_filename("あ" * 100, "001")
+        self.assertTrue(jp.endswith(".wav"))
+        self.assertLessEqual(len(jp.encode("utf-8")), 204)
+        self.assertEqual(jp, ("あ" * 66) + ".wav")
+
+        emoji = self.api._sanitize_wav_filename("🎵" * 80, "001")
+        self.assertLessEqual(len(emoji.encode("utf-8")), 204)
+        self.assertEqual(emoji, ("🎵" * 50) + ".wav")
+
+        used: set[str] = set()
+        first = self.api._unique_wav_filename(jp, used)
+        second = self.api._unique_wav_filename(jp, used)
+        self.assertNotEqual(first, second)
+        self.assertLessEqual(len(second.encode("utf-8")), 204)
+
 
 class SynthesizeEndpointTests(unittest.TestCase):
     def setUp(self):
@@ -168,6 +184,47 @@ class SynthesizeEndpointTests(unittest.TestCase):
             clean_text=True,
             timeout=180.0,
         )
+
+    def test_single_synthesize_json_format_preserves_full_long_applied_text(self):
+        import base64
+
+        long_text = "あ" * 650
+        self.mock_synth.return_value = _FakeResult(
+            wav_bytes=_make_dummy_wav(),
+            duration_sec=1.234,
+            sample_rate=24000,
+            engine_name="elevenlabs",
+            applied_text=long_text,
+        )
+        res = self.client.post(
+            "/api/addon/saiverse-voice-tts/synthesize",
+            json={
+                "persona_id": "air_city_a",
+                "text": long_text,
+                "response_format": "json",
+            },
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertEqual(body["applied_text"], long_text)
+        self.assertEqual(len(body["applied_text"]), 650)
+        self.assertEqual(body["engine"], "elevenlabs")
+        self.assertEqual(body["sample_rate"], 24000)
+        self.assertTrue(base64.b64decode(body["audio_base64"]).startswith(b"RIFF"))
+
+        # WAV モードではヘッダプレビューが切り詰められた旨を明示し、不正フォーマットは 400
+        res_wav = self.client.post(
+            "/api/addon/saiverse-voice-tts/synthesize",
+            json={"persona_id": "air_city_a", "text": long_text},
+        )
+        self.assertEqual(res_wav.status_code, 200)
+        self.assertEqual(res_wav.headers["x-tts-applied-text-truncated"], "true")
+
+        res_bad = self.client.post(
+            "/api/addon/saiverse-voice-tts/synthesize",
+            json={"persona_id": "air_city_a", "text": "hi", "response_format": "xml"},
+        )
+        self.assertEqual(res_bad.status_code, 400)
 
     def test_single_synthesize_validation_and_error_mapping(self):
         res = self.client.post("/api/addon/saiverse-voice-tts/synthesize", json={"text": "hi"})

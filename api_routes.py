@@ -22,6 +22,7 @@ auth gate.
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime
 import functools
 import io
@@ -35,7 +36,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 LOGGER = logging.getLogger(__name__)
 _ADDON_NAME = "saiverse-voice-tts"
@@ -415,6 +416,10 @@ async def list_audio_devices() -> dict:
 # ---------------------------------------------------------------------------
 _BATCH_MAX_ITEMS = 200
 _SYNTH_TIMEOUT_SEC = 180.0
+# Linux (ext4 / APFS 等) の一般的なファイル名上限 255 バイトに、拡張子 ".wav" (4B)、
+# 重複連番サフィックス ("_999999" 等) や Windows 予約名回避 "_" を足しても確実に
+# 収まるよう、stem の UTF-8 エンコード長を 200 バイト以下に制限する。
+_MAX_STEM_UTF8_BYTES = 200
 _INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _WINDOWS_RESERVED_STEMS = frozenset({
     "CON", "PRN", "AUX", "NUL",
@@ -423,12 +428,29 @@ _WINDOWS_RESERVED_STEMS = frozenset({
 })
 
 
+def _truncate_utf8_bytes(text: str, max_bytes: int) -> str:
+    """文字境界を壊さずに UTF-8 バイト長が ``max_bytes`` 以下になる先頭部分を返す。"""
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        ch_len = len(ch.encode("utf-8"))
+        if used + ch_len > max_bytes:
+            break
+        out.append(ch)
+        used += ch_len
+    return "".join(out)
+
+
 def _sanitize_wav_filename(raw: Any, fallback_stem: str) -> str:
     """利用者指定のファイル名を安全な単一階層の `.wav` ファイル名へ整える。
 
     パストラバーサル (`/` `\\` `..`)、制御文字、Windows 禁止文字・予約デバイス名を
-    無害化し、空になれば ``fallback_stem`` を使う。
+    無害化し、UTF-8 バイト長もファイルシステム上限内に収める。空になれば
+    ``fallback_stem`` を使う。
     """
+    safe_fallback = _truncate_utf8_bytes(fallback_stem, _MAX_STEM_UTF8_BYTES).strip(" ._") or "voice"
     text = str(raw or "").strip()
     if text:
         # パス区切りは取り除かず、全体を安全な文字へ置換して階層抜けを防ぐ
@@ -438,11 +460,10 @@ def _sanitize_wav_filename(raw: Any, fallback_stem: str) -> str:
         text = re.sub(r"_+", "_", text)
         text = text.strip(" ._")
     if text.lower().endswith(".wav"):
-        text = text[:-4].strip(" .")
+        text = text[:-4].strip(" ._")
     if not text:
-        text = fallback_stem
-    if len(text) > 100:
-        text = text[:100].rstrip(" .") or fallback_stem
+        text = safe_fallback
+    text = _truncate_utf8_bytes(text, _MAX_STEM_UTF8_BYTES).rstrip(" ._") or safe_fallback
     if text.upper() in _WINDOWS_RESERVED_STEMS:
         text = f"{text}_"
     return f"{text}.wav"
@@ -457,7 +478,10 @@ def _unique_wav_filename(candidate: str, used_lower: set[str]) -> str:
     stem = candidate[:-4] if lower.endswith(".wav") else candidate
     suffix = 2
     while True:
-        alt = f"{stem}_{suffix}.wav"
+        suffix_str = f"_{suffix}"
+        max_stem_bytes = max(1, _MAX_STEM_UTF8_BYTES - len(suffix_str.encode("utf-8")))
+        trimmed_stem = _truncate_utf8_bytes(stem, max_stem_bytes).rstrip(" ._") or "voice"
+        alt = f"{trimmed_stem}{suffix_str}.wav"
         if alt.lower() not in used_lower:
             used_lower.add(alt.lower())
             return alt
@@ -515,6 +539,12 @@ async def synthesize_test_audio(
     apply_pronunciation = bool(body.get("apply_pronunciation", True))
     clean_text = bool(body.get("clean_text", True))
     raw_filename = body.get("filename")
+    response_format = str(body.get("response_format") or "wav").strip().lower()
+    if response_format not in {"wav", "json"}:
+        raise HTTPException(
+            status_code=400,
+            detail="response_format must be 'wav' or 'json'",
+        )
 
     pw = _playback_worker_module()
     if pw is None or not hasattr(pw, "synthesize_wav"):
@@ -540,10 +570,25 @@ async def synthesize_test_audio(
     except Exception as exc:
         raise _map_synthesis_exception(exc, pw) from exc
 
+    if response_format == "json":
+        # 長文 (500 文字超) でも HTTP ヘッダサイズ制限に引っかからず完全な
+        # applied_text を UI (単発プレビュー / 一括 manifest.json) へ届ける経路。
+        return JSONResponse(
+            content={
+                "audio_base64": base64.b64encode(result.wav_bytes).decode("ascii"),
+                "engine": str(result.engine_name),
+                "duration_sec": round(float(result.duration_sec), 3),
+                "sample_rate": int(result.sample_rate),
+                "applied_text": result.applied_text,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     fallback_stem = f"{persona_id}_test"
     download_name = _sanitize_wav_filename(raw_filename, fallback_stem)
     applied_preview = result.applied_text
-    if len(applied_preview) > 500:
+    applied_truncated = len(applied_preview) > 500
+    if applied_truncated:
         applied_preview = applied_preview[:500] + "…"
 
     headers = {
@@ -552,6 +597,7 @@ async def synthesize_test_audio(
         "X-TTS-Duration-Sec": f"{result.duration_sec:.3f}",
         "X-TTS-Sample-Rate": str(result.sample_rate),
         "X-TTS-Applied-Text": urllib.parse.quote(applied_preview, safe=""),
+        "X-TTS-Applied-Text-Truncated": "true" if applied_truncated else "false",
         "Cache-Control": "no-store",
     }
     return Response(content=result.wav_bytes, media_type="audio/wav", headers=headers)

@@ -21,6 +21,7 @@ import {
     allocateUniqueWavName,
     buildZipBytes,
     canReuseSingleSynthCache,
+    decodeBase64ToBytes,
     parseBatchInput,
     sanitizeWavFilename,
     type BatchInputMode,
@@ -106,6 +107,20 @@ function triggerDownload(blob: Blob, filename: string): void {
     a.click();
     a.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+interface SynthesizeJsonResponse {
+    audio_base64: string;
+    engine?: string;
+    duration_sec?: number | null;
+    sample_rate?: number | null;
+    applied_text?: string;
+}
+
+function bytesToWavBlob(bytes: Uint8Array): Blob {
+    const ab = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(ab).set(bytes);
+    return new Blob([ab], { type: "audio/wav" });
 }
 
 async function extractErrorDetail(res: Response): Promise<string> {
@@ -243,24 +258,19 @@ export default function VoiceTtsPersonaPanel({
                     apply_pronunciation: applyPronunciation,
                     clean_text: true,
                     filename: singleFilename.trim() || undefined,
+                    response_format: "json",
                 }),
             });
             if (!res.ok) {
                 throw new Error(await extractErrorDetail(res));
             }
-            const blob = await res.blob();
-            const engine = res.headers.get("X-TTS-Engine") ?? "";
-            const durRaw = res.headers.get("X-TTS-Duration-Sec");
-            const srRaw = res.headers.get("X-TTS-Sample-Rate");
-            const appliedRaw = res.headers.get("X-TTS-Applied-Text") ?? "";
-            let appliedText = trimmed;
-            if (appliedRaw) {
-                try {
-                    appliedText = decodeURIComponent(appliedRaw);
-                } catch {
-                    appliedText = appliedRaw;
-                }
-            }
+            const data = (await res.json()) as SynthesizeJsonResponse;
+            const wavBytes = decodeBase64ToBytes(data.audio_base64);
+            const blob = bytesToWavBlob(wavBytes);
+            const engine = String(data.engine ?? "");
+            const durationSec = typeof data.duration_sec === "number" ? data.duration_sec : null;
+            const sampleRate = typeof data.sample_rate === "number" ? data.sample_rate : null;
+            const appliedText = typeof data.applied_text === "string" ? data.applied_text : trimmed;
 
             if (singleUrlRef.current) {
                 URL.revokeObjectURL(singleUrlRef.current);
@@ -276,8 +286,8 @@ export default function VoiceTtsPersonaPanel({
                 blob,
                 objectUrl,
                 engine,
-                durationSec: durRaw ? Number(durRaw) : null,
-                sampleRate: srRaw ? Number(srRaw) : null,
+                durationSec,
+                sampleRate,
                 appliedText,
             };
             setSingleResult(cache);
@@ -449,29 +459,23 @@ export default function VoiceTtsPersonaPanel({
                             apply_pronunciation: applyPronunciation,
                             clean_text: true,
                             filename: wavName,
+                            response_format: "json",
                         }),
                     });
                     if (!res.ok) {
                         throw new Error(await extractErrorDetail(res));
                     }
-                    const arrayBuf = await res.arrayBuffer();
-                    const wavBytes = new Uint8Array(arrayBuf);
-                    const blob = new Blob([arrayBuf], { type: "audio/wav" });
+                    const data = (await res.json()) as SynthesizeJsonResponse;
+                    const wavBytes = decodeBase64ToBytes(data.audio_base64);
+                    const blob = bytesToWavBlob(wavBytes);
                     const objectUrl = URL.createObjectURL(blob);
                     batchUrlsRef.current.push(objectUrl);
 
-                    const engine = res.headers.get("X-TTS-Engine") ?? "";
-                    const durRaw = res.headers.get("X-TTS-Duration-Sec");
-                    const srRaw = res.headers.get("X-TTS-Sample-Rate");
-                    const appliedRaw = res.headers.get("X-TTS-Applied-Text") ?? "";
-                    let appliedText = item.text;
-                    if (appliedRaw) {
-                        try {
-                            appliedText = decodeURIComponent(appliedRaw);
-                        } catch {
-                            appliedText = appliedRaw;
-                        }
-                    }
+                    const engine = String(data.engine ?? "");
+                    const durationSec = typeof data.duration_sec === "number" ? data.duration_sec : null;
+                    const sampleRate = typeof data.sample_rate === "number" ? data.sample_rate : null;
+                    const appliedText =
+                        typeof data.applied_text === "string" ? data.applied_text : item.text;
 
                     collected.push({
                         index: item.index,
@@ -481,8 +485,8 @@ export default function VoiceTtsPersonaPanel({
                         text: item.text,
                         appliedText,
                         engine,
-                        durationSec: durRaw ? Number(durRaw) : null,
-                        sampleRate: srRaw ? Number(srRaw) : null,
+                        durationSec,
+                        sampleRate,
                         wavBytes,
                         objectUrl,
                     });
@@ -670,7 +674,10 @@ export default function VoiceTtsPersonaPanel({
                             </div>
                             {singleResult.appliedText !== singleResult.text && (
                                 <div style={styles.appliedTextHint}>
-                                    読み上げ文 (辞書/整形後): {singleResult.appliedText}
+                                    読み上げ文 (辞書/整形後):{" "}
+                                    {singleResult.appliedText.length > 500
+                                        ? `${singleResult.appliedText.slice(0, 500)}…`
+                                        : singleResult.appliedText}
                                 </div>
                             )}
                             {isSingleResultStale && (

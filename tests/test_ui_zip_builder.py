@@ -84,12 +84,26 @@ assert.ok(r3.error);
 const r4 = zb.parseBatchInput('{"a": 1}', "json");
 assert.ok(r4.error);
 
-// 4. Filename sanitization & deduplication
+// 4. Filename sanitization, UTF-8 byte bounds & deduplication
 assert.equal(zb.sanitizeWavFilename("../a/b:c", "001"), "a_b_c.wav");
 assert.equal(zb.sanitizeWavFilename("CON", "001"), "CON_.wav");
+const longJp = zb.sanitizeWavFilename("あ".repeat(100), "001");
+assert.equal(longJp, "あ".repeat(66) + ".wav");
+assert.ok(zb.utf8ByteLength(longJp) <= 204);
+const longEmoji = zb.sanitizeWavFilename("🎵".repeat(80), "001");
+assert.equal(longEmoji, "🎵".repeat(50) + ".wav");
+assert.ok(zb.utf8ByteLength(longEmoji) <= 204);
 const used = new Set(["manifest.json"]);
 assert.equal(zb.allocateUniqueWavName("Hi.wav", used), "Hi.wav");
 assert.equal(zb.allocateUniqueWavName("hi.wav", used), "hi_2.wav");
+const longDup1 = zb.allocateUniqueWavName(longJp, used);
+const longDup2 = zb.allocateUniqueWavName(longJp, used);
+assert.notEqual(longDup1, longDup2);
+assert.ok(zb.utf8ByteLength(longDup2) <= 204);
+assert.deepEqual(
+    Array.from(zb.decodeBase64ToBytes(Buffer.from("RIFF").toString("base64"))),
+    [0x52, 0x49, 0x46, 0x46],
+);
 
 // 4b. Single-preview WAV cache invalidation when configRevision changes or is absent
 const baseKey = { personaId: "air_city_a", text: "おはよう", applyPronunciation: true, configRevision: 3 };

@@ -54,6 +54,49 @@ export function canReuseSingleSynthCache(
 }
 
 export const BATCH_MAX_ITEMS = 200;
+/**
+ * Upper bound for the sanitized filename stem in UTF-8 bytes.
+ * Leaves room for ".wav" (4B), deduplication suffix ("_999999" etc.), and
+ * Windows reserved-name "_" suffix while staying well under the 255-byte
+ * NAME_MAX limit on Linux/macOS filesystems. Mirrors backend api_routes.py.
+ */
+export const MAX_STEM_UTF8_BYTES = 200;
+
+const _UTF8_ENCODER = new TextEncoder();
+
+export function utf8ByteLength(text: string): number {
+    return _UTF8_ENCODER.encode(text).length;
+}
+
+/**
+ * Truncate a string without splitting UTF-8 code points so its UTF-8 encoded
+ * byte length is at most `maxBytes`.
+ */
+export function truncateUtf8Bytes(text: string, maxBytes: number): string {
+    if (utf8ByteLength(text) <= maxBytes) {
+        return text;
+    }
+    let out = "";
+    let used = 0;
+    for (const ch of text) {
+        const len = utf8ByteLength(ch);
+        if (used + len > maxBytes) {
+            break;
+        }
+        out += ch;
+        used += len;
+    }
+    return out;
+}
+
+export function decodeBase64ToBytes(b64: string): Uint8Array {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+        out[i] = bin.charCodeAt(i);
+    }
+    return out;
+}
 
 const INVALID_FILENAME_CHARS_RE = /[<>:"/\\|?*\x00-\x1f\x7f]/g;
 const WINDOWS_RESERVED_STEMS = new Set([
@@ -67,6 +110,9 @@ const WINDOWS_RESERVED_STEMS = new Set([
  * Mirrors backend `api_routes._sanitize_wav_filename`.
  */
 export function sanitizeWavFilename(raw: string | null | undefined, fallbackStem: string): string {
+    const safeFallback =
+        truncateUtf8Bytes(fallbackStem, MAX_STEM_UTF8_BYTES).replace(/^[ ._]+|[ ._]+$/g, "") ||
+        "voice";
     let text = String(raw ?? "").trim();
     if (text) {
         text = text.replace(/\//g, "_").replace(/\\/g, "_");
@@ -79,11 +125,9 @@ export function sanitizeWavFilename(raw: string | null | undefined, fallbackStem
         text = text.slice(0, -4).replace(/^[ ._]+|[ ._]+$/g, "");
     }
     if (!text) {
-        text = fallbackStem;
+        text = safeFallback;
     }
-    if (text.length > 100) {
-        text = text.slice(0, 100).replace(/[ ._]+$/g, "") || fallbackStem;
-    }
+    text = truncateUtf8Bytes(text, MAX_STEM_UTF8_BYTES).replace(/[ ._]+$/g, "") || safeFallback;
     if (WINDOWS_RESERVED_STEMS.has(text.toUpperCase())) {
         text = `${text}_`;
     }
@@ -99,7 +143,11 @@ export function allocateUniqueWavName(candidate: string, usedLower: Set<string>)
     const stem = lower.endsWith(".wav") ? candidate.slice(0, -4) : candidate;
     let suffix = 2;
     while (true) {
-        const alt = `${stem}_${suffix}.wav`;
+        const suffixStr = `_${suffix}`;
+        const maxStemBytes = Math.max(1, MAX_STEM_UTF8_BYTES - utf8ByteLength(suffixStr));
+        const trimmedStem =
+            truncateUtf8Bytes(stem, maxStemBytes).replace(/[ ._]+$/g, "") || "voice";
+        const alt = `${trimmedStem}${suffixStr}.wav`;
         if (!usedLower.has(alt.toLowerCase())) {
             usedLower.add(alt.toLowerCase());
             return alt;
