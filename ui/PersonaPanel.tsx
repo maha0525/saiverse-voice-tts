@@ -155,6 +155,8 @@ export default function VoiceTtsPersonaPanel({
     const [singleError, setSingleError] = useState<string | null>(null);
     const [singleResult, setSingleResult] = useState<SingleSynthCache | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
+    const singleSeqRef = useRef<number>(0);
+    const singleAbortRef = useRef<AbortController | null>(null);
 
     // ----- Batch export state -----
     const [batchMode, setBatchMode] = useState<BatchInputMode>("json");
@@ -165,6 +167,7 @@ export default function VoiceTtsPersonaPanel({
     const [batchResults, setBatchResults] = useState<BatchResultItem[]>([]);
     const [batchCancelled, setBatchCancelled] = useState<boolean>(false);
     const [previewingIndex, setPreviewingIndex] = useState<number | null>(null);
+    const batchSeqRef = useRef<number>(0);
     const batchAbortRef = useRef<AbortController | null>(null);
     const batchFileInputRef = useRef<HTMLInputElement | null>(null);
     const batchAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -174,6 +177,9 @@ export default function VoiceTtsPersonaPanel({
     const batchUrlsRef = useRef<string[]>([]);
 
     const revokeSingleResult = useCallback(() => {
+        if (audioRef.current) {
+            audioRef.current.pause();
+        }
         if (singleUrlRef.current) {
             URL.revokeObjectURL(singleUrlRef.current);
             singleUrlRef.current = null;
@@ -182,6 +188,10 @@ export default function VoiceTtsPersonaPanel({
     }, []);
 
     const revokeBatchResults = useCallback(() => {
+        if (batchAudioRef.current) {
+            batchAudioRef.current.pause();
+            batchAudioRef.current.removeAttribute("src");
+        }
         for (const u of batchUrlsRef.current) {
             URL.revokeObjectURL(u);
         }
@@ -190,17 +200,36 @@ export default function VoiceTtsPersonaPanel({
         setPreviewingIndex(null);
     }, []);
 
-    // ペルソナ切替時: 入力文は保持して別ペルソナとの聴き比べをしやすくし、
-    // 旧ペルソナの合成済み音声プレビュー・エラーだけクリアする。
+    // ペルソナ切替時: 入力文・一括リストのテキストは保持して別ペルソナとの
+    // 聴き比べや連続出力をしやすくしつつ、進行中の合成リクエストは中断・破棄し、
+    // 旧ペルソナの合成済み音声プレビュー・結果・エラーをすべてクリアする。
     useEffect(() => {
+        singleSeqRef.current += 1;
+        singleAbortRef.current?.abort();
+        singleAbortRef.current = null;
+        setSingleBusy(false);
         revokeSingleResult();
         setSingleError(null);
-    }, [personaId, revokeSingleResult]);
+
+        batchSeqRef.current += 1;
+        batchAbortRef.current?.abort();
+        batchAbortRef.current = null;
+        setBatchBusy(false);
+        setBatchProgress(null);
+        setBatchCancelled(false);
+        setBatchError(null);
+        revokeBatchResults();
+    }, [personaId, revokeBatchResults, revokeSingleResult]);
 
     // Unmount cleanup
     useEffect(() => {
         return () => {
+            singleSeqRef.current += 1;
+            singleAbortRef.current?.abort();
+            singleAbortRef.current = null;
+            batchSeqRef.current += 1;
             batchAbortRef.current?.abort();
+            batchAbortRef.current = null;
             if (singleUrlRef.current) {
                 URL.revokeObjectURL(singleUrlRef.current);
                 singleUrlRef.current = null;
@@ -221,12 +250,20 @@ export default function VoiceTtsPersonaPanel({
             setSingleError("読み上げるテキストを入力してください。");
             return;
         }
+        singleAbortRef.current?.abort();
+        const controller = new AbortController();
+        singleAbortRef.current = controller;
+        const seq = ++singleSeqRef.current;
+
         setSingleError(null);
         setSingleBusy(true);
         try {
             // 直前に編集された Voice ID・参照音声・話速・読み方辞書などの
             // 保存リクエスト完了を、キャッシュ判定より先に必ず待つ。
             await flushPendingSaves?.();
+            if (seq !== singleSeqRef.current || controller.signal.aborted) {
+                return;
+            }
             const currentRevision = getConfigRevision?.() ?? configRevision ?? null;
 
             // 同じペルソナ・同じ文・同じ辞書設定・かつ設定リビジョンが変わって
@@ -252,6 +289,7 @@ export default function VoiceTtsPersonaPanel({
             const res = await fetch(`${addonApiBase}/synthesize`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
+                signal: controller.signal,
                 body: JSON.stringify({
                     persona_id: personaId,
                     text: trimmed,
@@ -261,10 +299,16 @@ export default function VoiceTtsPersonaPanel({
                     response_format: "json",
                 }),
             });
+            if (seq !== singleSeqRef.current || controller.signal.aborted) {
+                return;
+            }
             if (!res.ok) {
                 throw new Error(await extractErrorDetail(res));
             }
             const data = (await res.json()) as SynthesizeJsonResponse;
+            if (seq !== singleSeqRef.current || controller.signal.aborted) {
+                return;
+            }
             const wavBytes = decodeBase64ToBytes(data.audio_base64);
             const blob = bytesToWavBlob(wavBytes);
             const engine = String(data.engine ?? "");
@@ -295,6 +339,7 @@ export default function VoiceTtsPersonaPanel({
             if (options.autoPlay) {
                 // DOM の <audio src={objectUrl}> 反映後に再生を開始
                 window.setTimeout(() => {
+                    if (seq !== singleSeqRef.current) return;
                     const el = audioRef.current;
                     if (!el) return;
                     el.currentTime = 0;
@@ -310,9 +355,15 @@ export default function VoiceTtsPersonaPanel({
                 triggerDownload(blob, saveName);
             }
         } catch (err) {
+            if (seq !== singleSeqRef.current || controller.signal.aborted) {
+                return;
+            }
             setSingleError(err instanceof Error ? err.message : String(err));
         } finally {
-            setSingleBusy(false);
+            if (seq === singleSeqRef.current) {
+                singleAbortRef.current = null;
+                setSingleBusy(false);
+            }
         }
     }, [
         addonApiBase,
@@ -422,8 +473,10 @@ export default function VoiceTtsPersonaPanel({
         setBatchCancelled(false);
         setBatchBusy(true);
 
+        batchAbortRef.current?.abort();
         const controller = new AbortController();
         batchAbortRef.current = controller;
+        const seq = ++batchSeqRef.current;
 
         const items = parsedBatch.items;
         const padWidth = Math.max(3, String(items.length).length);
@@ -432,8 +485,14 @@ export default function VoiceTtsPersonaPanel({
 
         try {
             await flushPendingSaves?.();
+            if (seq !== batchSeqRef.current) {
+                return;
+            }
 
             for (let i = 0; i < items.length; i++) {
+                if (seq !== batchSeqRef.current) {
+                    return;
+                }
                 if (controller.signal.aborted) {
                     setBatchCancelled(true);
                     break;
@@ -462,10 +521,19 @@ export default function VoiceTtsPersonaPanel({
                             response_format: "json",
                         }),
                     });
+                    if (seq !== batchSeqRef.current) {
+                        return;
+                    }
                     if (!res.ok) {
                         throw new Error(await extractErrorDetail(res));
                     }
                     const data = (await res.json()) as SynthesizeJsonResponse;
+                    if (seq !== batchSeqRef.current || controller.signal.aborted) {
+                        if (seq === batchSeqRef.current) {
+                            setBatchCancelled(true);
+                        }
+                        break;
+                    }
                     const wavBytes = decodeBase64ToBytes(data.audio_base64);
                     const blob = bytesToWavBlob(wavBytes);
                     const objectUrl = URL.createObjectURL(blob);
@@ -491,6 +559,9 @@ export default function VoiceTtsPersonaPanel({
                         objectUrl,
                     });
                 } catch (err) {
+                    if (seq !== batchSeqRef.current) {
+                        return;
+                    }
                     if (controller.signal.aborted) {
                         setBatchCancelled(true);
                         break;
@@ -504,9 +575,15 @@ export default function VoiceTtsPersonaPanel({
                         error: err instanceof Error ? err.message : String(err),
                     });
                 }
+                if (seq !== batchSeqRef.current) {
+                    return;
+                }
                 setBatchResults([...collected]);
             }
 
+            if (seq !== batchSeqRef.current) {
+                return;
+            }
             const okCount = collected.filter((r) => r.status === "ok").length;
             if (okCount === 0 && !controller.signal.aborted) {
                 setBatchError("すべての項目の合成に失敗しました。各行のエラー内容を確認してください。");
@@ -514,13 +591,18 @@ export default function VoiceTtsPersonaPanel({
                 downloadBatchZip(collected);
             }
         } catch (err) {
+            if (seq !== batchSeqRef.current) {
+                return;
+            }
             if (!controller.signal.aborted) {
                 setBatchError(err instanceof Error ? err.message : String(err));
             }
         } finally {
-            batchAbortRef.current = null;
-            setBatchBusy(false);
-            setBatchProgress(null);
+            if (seq === batchSeqRef.current) {
+                batchAbortRef.current = null;
+                setBatchBusy(false);
+                setBatchProgress(null);
+            }
         }
     }, [
         addonApiBase,
