@@ -474,6 +474,31 @@ class _PieceJob:
 
 
 @dataclass
+class DirectSynthesisResult:
+    """テスト再生・素材ファイル出力向けの単発合成結果。"""
+    wav_bytes: bytes
+    duration_sec: float
+    sample_rate: int
+    engine_name: str
+    applied_text: str
+
+
+@dataclass
+class _DirectJob:
+    """``synthesize_wav`` の依頼。通常の ``_Job`` / ``_PieceJob`` と同じ
+    ``_queue`` に並べ、同じワーカースレッドでエンジンを直列実行する。
+
+    チャット吹き出し・SAIMemory・audio_stream・サーバー側スピーカー再生には
+    一切触れず、WAV バイト列とメタ情報だけを ``future`` に返す。
+    """
+    persona_id: str
+    text: str
+    apply_pronunciation: bool
+    clean_text: bool
+    future: "Future[DirectSynthesisResult]"
+
+
+@dataclass
 class _MessageState:
     """同 message_id の sub-text 群 (= sub_seq=1, 2, ...) で共有する状態。
 
@@ -506,7 +531,7 @@ class _MessageState:
 
 class _TTSWorker:
     def __init__(self) -> None:
-        self._queue: "queue.Queue[Optional[Union[_Job, _PieceJob]]]" = queue.Queue()
+        self._queue: "queue.Queue[Optional[Union[_Job, _PieceJob, _DirectJob]]]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         # (engine name, remote transport) -> engine. transport is () for the
@@ -1050,6 +1075,58 @@ class _TTSWorker:
             return
         job.future.set_result((audio, sample_rate))
 
+    def _process_direct(self, job: _DirectJob) -> None:
+        """``synthesize_wav`` の単発合成を処理して ``job.future`` へ返す。
+
+        テスト再生・音声ファイル保存専用。``auto_speak`` が OFF のペルソナでも
+        動作し、再生・audio_stream・画面通知・outputs/ への保存は一切しない。
+        """
+        if not job.future.set_running_or_notify_cancel():
+            LOGGER.debug("direct synthesis cancelled before start (persona=%s)", job.persona_id)
+            return
+        try:
+            effective = _get_effective_params(job.persona_id)
+            if not effective.get("_enabled", True):
+                raise VoiceUnavailable("voice-tts addon is disabled")
+            setup = self._prepare_synthesis(job.persona_id)
+            prepared = clean_text_for_tts(job.text) if job.clean_text else job.text
+            if job.apply_pronunciation:
+                tts_text = self._apply_pronunciation(prepared, setup.profile, job.persona_id)
+            else:
+                tts_text = prepared
+            if not tts_text.strip():
+                raise NothingToVoice("no voiceable text")
+            result = setup.engine.synthesize(
+                text=tts_text,
+                ref_audio=setup.ref_audio,
+                ref_text=setup.ref_text,
+                params=setup.params,
+            )
+            audio = _mono_float32(result.audio)
+            if audio.size == 0:
+                raise RuntimeError("synthesis produced no audio")
+            sample_rate = int(result.sample_rate)
+            if sample_rate <= 0:
+                raise RuntimeError("synthesis returned an invalid sample rate")
+            wav_bytes = _wav_bytes(audio, sample_rate)
+            duration_sec = len(audio) / float(sample_rate)
+        except Exception as exc:
+            LOGGER.warning(
+                "direct synthesis failed (persona=%s): %s: %s",
+                job.persona_id, type(exc).__name__, exc,
+            )
+            job.future.set_exception(exc)
+            return
+        job.future.set_result(
+            DirectSynthesisResult(
+                wav_bytes=wav_bytes,
+                duration_sec=duration_sec,
+                sample_rate=sample_rate,
+                engine_name=setup.engine_name,
+                applied_text=tts_text,
+            )
+        )
+
     def _process(self, job: _Job) -> None:
         # Pipeline Streaming finalize-only signal: text="" + is_final=True
         # の job は 「合成は不要、 既存 _MessageState を閉じて wav 保存だけ」
@@ -1199,6 +1276,8 @@ class _TTSWorker:
             try:
                 if isinstance(job, _PieceJob):
                     self._process_piece(job)
+                elif isinstance(job, _DirectJob):
+                    self._process_direct(job)
                 else:
                     self._process(job)
             except Exception:
@@ -1844,3 +1923,56 @@ def finish_message(
         version=version,
         pulse_id=pulse,
     )
+
+
+def synthesize_wav(
+    persona_id: str,
+    text: str,
+    *,
+    apply_pronunciation: bool = True,
+    clean_text: bool = True,
+    timeout: float = 120.0,
+) -> DirectSynthesisResult:
+    """指定ペルソナの声でテキストを単発合成し、WAV バイト列とメタ情報を返す。
+
+    アドオン管理画面の「テスト再生・音声ファイル出力」および一括 ZIP 出力から
+    呼ばれる。既存のワーカースレッドに並べて処理するため、通常会話の合成と
+    GPU エンジンを同時に使わない。
+
+    ``auto_speak`` が OFF のペルソナでも動作する。再生・吹き出しへの通知・
+    SAIMemory・``outputs/`` へのファイル保存は一切行わない。
+
+    Raises:
+        NothingToVoice: 整形・辞書適用後に読み上げる文字が残らない。
+        VoiceUnavailable: アドオンが無効、または声プロファイルが無い。
+        TimeoutError: ``timeout`` 秒までに合成が終わらなかった。
+        その他: エンジンの例外をそのまま送出する。
+    """
+    if not persona_id or not str(persona_id).strip():
+        raise VoiceUnavailable("persona_id is required")
+    prepared = clean_text_for_tts(text) if clean_text else text
+    if not prepared.strip():
+        raise NothingToVoice("no voiceable text")
+    params = _get_effective_params(persona_id)
+    if not params.get("_enabled", True):
+        raise VoiceUnavailable("voice-tts addon is disabled")
+
+    future: "Future[DirectSynthesisResult]" = Future()
+    _worker.start()
+    _worker._queue.put(
+        _DirectJob(
+            persona_id=str(persona_id),
+            text=str(text),
+            apply_pronunciation=bool(apply_pronunciation),
+            clean_text=bool(clean_text),
+            future=future,
+        )
+    )
+    try:
+        return future.result(timeout=timeout)
+    except _FutureTimeout:
+        future.cancel()
+        raise TimeoutError(
+            f"synthesis did not finish within {timeout:.1f}s"
+        ) from None
+

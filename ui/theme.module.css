@@ -1,0 +1,64 @@
+/*
+ * saiverse-voice-tts PersonaPanel のテーマ変数。
+ *
+ * light / dark の両方で独立に定義し、本体の未定義 CSS 変数に依存しないようにする。
+ * PersonaPanel.tsx から side-effect import して var(--voice-tts-*) を参照する。
+ */
+
+:global(:root) {
+    --voice-tts-bg: #f8fafc;
+    --voice-tts-surface: #ffffff;
+    --voice-tts-border: #cbd5e1;
+    --voice-tts-border-subtle: #e2e8f0;
+    --voice-tts-text: #0f172a;
+    --voice-tts-text-muted: #475569;
+    --voice-tts-text-subtle: #64748b;
+
+    --voice-tts-accent: #2563eb;
+    --voice-tts-accent-hover: #1d4ed8;
+    --voice-tts-accent-fg: #ffffff;
+    --voice-tts-accent-soft-bg: #dbeafe;
+    --voice-tts-accent-soft-fg: #1e40af;
+
+    --voice-tts-secondary-bg: #f1f5f9;
+    --voice-tts-secondary-fg: #1e293b;
+    --voice-tts-secondary-border: #cbd5e1;
+
+    --voice-tts-ok-bg: #dcfce7;
+    --voice-tts-ok-fg: #166534;
+    --voice-tts-err-bg: #fee2e2;
+    --voice-tts-err-fg: #991b1b;
+    --voice-tts-err-border: #ef4444;
+
+    --voice-tts-progress-track: #e2e8f0;
+    --voice-tts-progress-fill: #2563eb;
+}
+
+:global([data-theme="dark"]) {
+    --voice-tts-bg: #111827;
+    --voice-tts-surface: #1f2937;
+    --voice-tts-border: #374151;
+    --voice-tts-border-subtle: #293548;
+    --voice-tts-text: #f3f4f6;
+    --voice-tts-text-muted: #d1d5db;
+    --voice-tts-text-subtle: #9ca3af;
+
+    --voice-tts-accent: #3b82f6;
+    --voice-tts-accent-hover: #2563eb;
+    --voice-tts-accent-fg: #ffffff;
+    --voice-tts-accent-soft-bg: #1e3a5f;
+    --voice-tts-accent-soft-fg: #bfdbfe;
+
+    --voice-tts-secondary-bg: #273244;
+    --voice-tts-secondary-fg: #e5e7eb;
+    --voice-tts-secondary-border: #4b5563;
+
+    --voice-tts-ok-bg: #14532d;
+    --voice-tts-ok-fg: #bbf7d0;
+    --voice-tts-err-bg: #450a0a;
+    --voice-tts-err-fg: #fecaca;
+    --voice-tts-err-border: #dc2626;
+
+    --voice-tts-progress-track: #374151;
+    --voice-tts-progress-fill: #60a5fa;
+}

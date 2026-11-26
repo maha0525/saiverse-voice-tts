@@ -22,14 +22,21 @@ auth gate.
 from __future__ import annotations
 
 import asyncio
+import base64
+import datetime
 import functools
+import io
+import json
 import logging
 import queue
+import re
+import urllib.parse
+import zipfile
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 LOGGER = logging.getLogger(__name__)
 _ADDON_NAME = "saiverse-voice-tts"
@@ -402,3 +409,383 @@ async def list_audio_devices() -> dict:
     except Exception:
         LOGGER.exception("failed to enumerate audio devices")
     return {"options": options}
+
+
+# ---------------------------------------------------------------------------
+# Voice test & batch WAV/ZIP synthesis helpers
+# ---------------------------------------------------------------------------
+_BATCH_MAX_ITEMS = 200
+_SYNTH_TIMEOUT_SEC = 180.0
+# Linux (ext4 / APFS 等) の一般的なファイル名上限 255 バイトに、拡張子 ".wav" (4B)、
+# 重複連番サフィックス ("_999999" 等) や Windows 予約名回避 "_" を足しても確実に
+# 収まるよう、stem の UTF-8 エンコード長を 200 バイト以下に制限する。
+_MAX_STEM_UTF8_BYTES = 200
+_INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+_WINDOWS_RESERVED_STEMS = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
+
+
+def _truncate_utf8_bytes(text: str, max_bytes: int) -> str:
+    """文字境界を壊さずに UTF-8 バイト長が ``max_bytes`` 以下になる先頭部分を返す。"""
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        ch_len = len(ch.encode("utf-8"))
+        if used + ch_len > max_bytes:
+            break
+        out.append(ch)
+        used += ch_len
+    return "".join(out)
+
+
+def _sanitize_wav_filename(raw: Any, fallback_stem: str) -> str:
+    """利用者指定のファイル名を安全な単一階層の `.wav` ファイル名へ整える。
+
+    パストラバーサル (`/` `\\` `..`)、制御文字、Windows 禁止文字・予約デバイス名を
+    無害化し、UTF-8 バイト長もファイルシステム上限内に収める。空になれば
+    ``fallback_stem`` を使う。
+    """
+    safe_fallback = _truncate_utf8_bytes(fallback_stem, _MAX_STEM_UTF8_BYTES).strip(" ._") or "voice"
+    text = str(raw or "").strip()
+    if text:
+        # パス区切りは取り除かず、全体を安全な文字へ置換して階層抜けを防ぐ
+        text = text.replace("/", "_").replace("\\", "_")
+        text = _INVALID_FILENAME_CHARS_RE.sub("_", text)
+        text = text.replace("..", "_")
+        text = re.sub(r"_+", "_", text)
+        text = text.strip(" ._")
+    if text.lower().endswith(".wav"):
+        text = text[:-4].strip(" ._")
+    if not text:
+        text = safe_fallback
+    text = _truncate_utf8_bytes(text, _MAX_STEM_UTF8_BYTES).rstrip(" ._") or safe_fallback
+    head, sep, tail = text.partition(".")
+    trimmed_head = head.rstrip(" ")
+    if trimmed_head.upper() in _WINDOWS_RESERVED_STEMS:
+        if sep:
+            escaped = f"{trimmed_head}_{sep}{tail}"
+            text = _truncate_utf8_bytes(escaped, _MAX_STEM_UTF8_BYTES).rstrip(" .") or f"{trimmed_head}_"
+        else:
+            text = f"{trimmed_head}_"
+    return f"{text}.wav"
+
+
+def _unique_wav_filename(candidate: str, used_lower: set[str]) -> str:
+    """同一 ZIP 内で重複しないファイル名を割り当てる (大文字小文字非依存)。"""
+    lower = candidate.lower()
+    if lower not in used_lower:
+        used_lower.add(lower)
+        return candidate
+    stem = candidate[:-4] if lower.endswith(".wav") else candidate
+    suffix = 2
+    while True:
+        suffix_str = f"_{suffix}"
+        max_stem_bytes = max(1, _MAX_STEM_UTF8_BYTES - len(suffix_str.encode("utf-8")))
+        trimmed_stem = _truncate_utf8_bytes(stem, max_stem_bytes).rstrip(" ._") or "voice"
+        alt = f"{trimmed_stem}{suffix_str}.wav"
+        if alt.lower() not in used_lower:
+            used_lower.add(alt.lower())
+            return alt
+        suffix += 1
+
+
+def _content_disposition(kind: str, filename: str) -> str:
+    """ASCII フォールバック + RFC 5987 UTF-8 filename* 付き Content-Disposition。"""
+    ascii_fallback = re.sub(r"[^A-Za-z0-9._-]", "_", filename).strip("._")
+    if not ascii_fallback:
+        ascii_fallback = "voice.wav" if filename.lower().endswith(".wav") else "voices.zip"
+    elif filename.lower().endswith(".wav") and not ascii_fallback.lower().endswith(".wav"):
+        ascii_fallback += ".wav"
+    elif filename.lower().endswith(".zip") and not ascii_fallback.lower().endswith(".zip"):
+        ascii_fallback += ".zip"
+    encoded = urllib.parse.quote(filename, safe="")
+    return f'{kind}; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
+
+
+def _map_synthesis_exception(exc: Exception, pw: Any) -> HTTPException:
+    """``playback_worker.synthesize_wav`` の例外を適切な HTTPException に変換する。"""
+    nothing_cls = getattr(pw, "NothingToVoice", None)
+    unavail_cls = getattr(pw, "VoiceUnavailable", None)
+    if nothing_cls is not None and isinstance(exc, nothing_cls):
+        return HTTPException(status_code=400, detail=f"読み上げる文字がありません: {exc}")
+    if unavail_cls is not None and isinstance(exc, unavail_cls):
+        return HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, TimeoutError):
+        return HTTPException(status_code=504, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"音声合成に失敗しました: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# POST /synthesize
+# ---------------------------------------------------------------------------
+@router.post("/synthesize")
+async def synthesize_test_audio(
+    body: dict,
+    manager: Any = Depends(_get_manager_dep()),
+) -> Response:
+    """指定ペルソナの声でテキストを単発合成し、16-bit PCM WAV を返す。
+
+    アドオン管理画面 (PersonaPanel) のテスト再生・WAV 保存・一括出力の
+    各アイテム合成から呼ばれる。チャット履歴・吹き出し・SAIMemory・
+    サーバー側スピーカー再生には一切触れない。
+    """
+    persona_id = str(body.get("persona_id") or "").strip()
+    if not persona_id:
+        raise HTTPException(status_code=400, detail="persona_id is required")
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+
+    apply_pronunciation = bool(body.get("apply_pronunciation", True))
+    clean_text = bool(body.get("clean_text", True))
+    raw_filename = body.get("filename")
+    response_format = str(body.get("response_format") or "wav").strip().lower()
+    if response_format not in {"wav", "json"}:
+        raise HTTPException(
+            status_code=400,
+            detail="response_format must be 'wav' or 'json'",
+        )
+
+    pw = _playback_worker_module()
+    if pw is None or not hasattr(pw, "synthesize_wav"):
+        LOGGER.error(
+            "synthesize_test_audio: tools._loaded.speak.playback_worker.synthesize_wav unavailable"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="playback_worker module unavailable; host tool loader not initialised",
+        )
+
+    loop = asyncio.get_event_loop()
+    call = functools.partial(
+        pw.synthesize_wav,
+        persona_id=persona_id,
+        text=text,
+        apply_pronunciation=apply_pronunciation,
+        clean_text=clean_text,
+        timeout=_SYNTH_TIMEOUT_SEC,
+    )
+    try:
+        result = await loop.run_in_executor(None, call)
+    except Exception as exc:
+        raise _map_synthesis_exception(exc, pw) from exc
+
+    if response_format == "json":
+        # 長文 (500 文字超) でも HTTP ヘッダサイズ制限に引っかからず完全な
+        # applied_text を UI (単発プレビュー / 一括 manifest.json) へ届ける経路。
+        return JSONResponse(
+            content={
+                "audio_base64": base64.b64encode(result.wav_bytes).decode("ascii"),
+                "engine": str(result.engine_name),
+                "duration_sec": round(float(result.duration_sec), 3),
+                "sample_rate": int(result.sample_rate),
+                "applied_text": result.applied_text,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    fallback_stem = f"{persona_id}_test"
+    download_name = _sanitize_wav_filename(raw_filename, fallback_stem)
+    applied_preview = result.applied_text
+    applied_truncated = len(applied_preview) > 500
+    if applied_truncated:
+        applied_preview = applied_preview[:500] + "…"
+
+    headers = {
+        "Content-Disposition": _content_disposition("inline", download_name),
+        "X-TTS-Engine": str(result.engine_name),
+        "X-TTS-Duration-Sec": f"{result.duration_sec:.3f}",
+        "X-TTS-Sample-Rate": str(result.sample_rate),
+        "X-TTS-Applied-Text": urllib.parse.quote(applied_preview, safe=""),
+        "X-TTS-Applied-Text-Truncated": "true" if applied_truncated else "false",
+        "Cache-Control": "no-store",
+    }
+    return Response(content=result.wav_bytes, media_type="audio/wav", headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# POST /synthesize-batch
+# ---------------------------------------------------------------------------
+def _normalize_batch_items(
+    raw_items: Any,
+    default_persona_id: str,
+) -> list[dict[str, str | None]]:
+    """一括合成の ``items`` 配列を検証・正規化する。
+
+    受け付ける要素:
+      - ``"おはよう！"`` (文字列)
+      - ``{"text": "おはよう！", "filename": "greeting", "persona_id": "..."}`` (オブジェクト)
+    """
+    if not isinstance(raw_items, list) or len(raw_items) == 0:
+        raise HTTPException(status_code=400, detail="items must be a non-empty array")
+    if len(raw_items) > _BATCH_MAX_ITEMS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"items exceeds maximum of {_BATCH_MAX_ITEMS} (got {len(raw_items)})",
+        )
+    normalized: list[dict[str, str | None]] = []
+    for idx, entry in enumerate(raw_items, start=1):
+        if isinstance(entry, str):
+            text = entry
+            filename = None
+            persona_id = default_persona_id
+        elif isinstance(entry, dict):
+            raw_text = entry.get("text")
+            if not isinstance(raw_text, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"items[{idx - 1}].text must be a string",
+                )
+            text = raw_text
+            raw_fn = entry.get("filename")
+            filename = str(raw_fn) if raw_fn is not None else None
+            raw_pid = entry.get("persona_id")
+            persona_id = str(raw_pid).strip() if raw_pid is not None and str(raw_pid).strip() else default_persona_id
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"items[{idx - 1}] must be a string or an object with 'text'",
+            )
+        if not persona_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"items[{idx - 1}]: persona_id is required",
+            )
+        normalized.append({
+            "text": text,
+            "filename": filename,
+            "persona_id": persona_id,
+        })
+    return normalized
+
+
+@router.post("/synthesize-batch")
+async def synthesize_batch_zip(
+    body: dict,
+    manager: Any = Depends(_get_manager_dep()),
+) -> Response:
+    """複数テキストを順番に合成し、WAV 群と ``manifest.json`` をまとめた ZIP を返す。
+
+    1 件でも合成に成功すれば ZIP を返し、失敗した要素は ``manifest.json`` に
+    理由を記録する。全件失敗したときのみ HTTP エラーを返す。
+    """
+    default_persona_id = str(body.get("persona_id") or "").strip()
+    items = _normalize_batch_items(body.get("items"), default_persona_id)
+    apply_pronunciation = bool(body.get("apply_pronunciation", True))
+    clean_text = bool(body.get("clean_text", True))
+
+    pw = _playback_worker_module()
+    if pw is None or not hasattr(pw, "synthesize_wav"):
+        raise HTTPException(
+            status_code=500,
+            detail="playback_worker module unavailable; host tool loader not initialised",
+        )
+
+    loop = asyncio.get_event_loop()
+    pad_width = max(3, len(str(len(items))))
+    used_names: set[str] = {"manifest.json"}
+    zip_buf = io.BytesIO()
+    manifest_items: list[dict[str, Any]] = []
+    succeeded = 0
+    failed = 0
+    first_error: Exception | None = None
+
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for idx, item in enumerate(items, start=1):
+            text = str(item["text"] or "")
+            persona_id = str(item["persona_id"] or "")
+            fallback_stem = f"{idx:0{pad_width}d}"
+            raw_fn = item["filename"]
+            # manifest.json と被らないように WAV 拡張子付きで一意化
+            wav_name = _unique_wav_filename(
+                _sanitize_wav_filename(raw_fn, fallback_stem),
+                used_names,
+            )
+
+            if not text.strip():
+                failed += 1
+                manifest_items.append({
+                    "index": idx,
+                    "status": "error",
+                    "persona_id": persona_id,
+                    "filename": None,
+                    "text": text,
+                    "error": "empty text",
+                })
+                continue
+
+            call = functools.partial(
+                pw.synthesize_wav,
+                persona_id=persona_id,
+                text=text,
+                apply_pronunciation=apply_pronunciation,
+                clean_text=clean_text,
+                timeout=_SYNTH_TIMEOUT_SEC,
+            )
+            try:
+                result = await loop.run_in_executor(None, call)
+            except Exception as exc:
+                failed += 1
+                if first_error is None:
+                    first_error = exc
+                manifest_items.append({
+                    "index": idx,
+                    "status": "error",
+                    "persona_id": persona_id,
+                    "filename": None,
+                    "text": text,
+                    "error": str(exc),
+                })
+                continue
+
+            zf.writestr(wav_name, result.wav_bytes)
+            succeeded += 1
+            manifest_items.append({
+                "index": idx,
+                "status": "ok",
+                "persona_id": persona_id,
+                "filename": wav_name,
+                "text": text,
+                "applied_text": result.applied_text,
+                "engine": result.engine_name,
+                "duration_sec": round(result.duration_sec, 3),
+                "sample_rate": result.sample_rate,
+            })
+
+        if succeeded == 0:
+            if first_error is not None:
+                raise _map_synthesis_exception(first_error, pw)
+            raise HTTPException(status_code=400, detail="no voiceable items in batch")
+
+        manifest = {
+            "persona_id": default_persona_id or None,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "total": len(items),
+            "succeeded": succeeded,
+            "failed": failed,
+            "items": manifest_items,
+        }
+        zf.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem_base = default_persona_id or "voices"
+    safe_stem = _sanitize_wav_filename(stem_base, "voices")[:-4]
+    zip_name = f"{safe_stem}_voices_{ts}.zip"
+    headers = {
+        "Content-Disposition": _content_disposition("attachment", zip_name),
+        "X-TTS-Batch-Total": str(len(items)),
+        "X-TTS-Batch-Succeeded": str(succeeded),
+        "X-TTS-Batch-Failed": str(failed),
+        "Cache-Control": "no-store",
+    }
+    return Response(content=zip_buf.getvalue(), media_type="application/zip", headers=headers)
+
