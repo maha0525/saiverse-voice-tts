@@ -20,6 +20,7 @@ import "./theme.module.css";
 import {
     allocateUniqueWavName,
     buildZipBytes,
+    canReuseSingleSynthCache,
     parseBatchInput,
     sanitizeWavFilename,
     type BatchInputMode,
@@ -38,6 +39,8 @@ interface AddonPersonaPanelProps {
     addonApiBase: string;
     onConfigChanged?: () => void | Promise<void>;
     flushPendingSaves?: () => Promise<void>;
+    configRevision?: number;
+    getConfigRevision?: () => number;
 }
 
 type PanelTab = "single" | "batch";
@@ -46,6 +49,7 @@ interface SingleSynthCache {
     personaId: string;
     text: string;
     applyPronunciation: boolean;
+    configRevision: number | null;
     blob: Blob;
     objectUrl: string;
     engine: string;
@@ -123,6 +127,8 @@ export default function VoiceTtsPersonaPanel({
     personaName,
     addonApiBase,
     flushPendingSaves,
+    configRevision,
+    getConfigRevision,
 }: AddonPersonaPanelProps) {
     const [tab, setTab] = useState<PanelTab>("single");
     const [applyPronunciation, setApplyPronunciation] = useState<boolean>(true);
@@ -201,26 +207,32 @@ export default function VoiceTtsPersonaPanel({
             return;
         }
         setSingleError(null);
-
-        // 同じペルソナ・同じ文・同じ辞書設定のキャッシュがあれば、保存時は再合成しない
-        if (
-            options.download &&
-            !options.autoPlay &&
-            singleResult &&
-            singleResult.personaId === personaId &&
-            singleResult.text === trimmed &&
-            singleResult.applyPronunciation === applyPronunciation
-        ) {
-            const fallback = `${personaName || personaId}_${formatTimestamp()}`;
-            const saveName = sanitizeWavFilename(singleFilename, fallback);
-            triggerDownload(singleResult.blob, saveName);
-            return;
-        }
-
         setSingleBusy(true);
         try {
-            // 直前に編集された Voice ID・話速などの保存リクエスト完了を待つ
+            // 直前に編集された Voice ID・参照音声・話速・読み方辞書などの
+            // 保存リクエスト完了を、キャッシュ判定より先に必ず待つ。
             await flushPendingSaves?.();
+            const currentRevision = getConfigRevision?.() ?? configRevision ?? null;
+
+            // 同じペルソナ・同じ文・同じ辞書設定・かつ設定リビジョンが変わって
+            // いないときだけプレビュー済み WAV を再利用する (リビジョン未提供時は
+            // 安全側で必ず再合成)。
+            if (
+                options.download &&
+                !options.autoPlay &&
+                singleResult &&
+                canReuseSingleSynthCache(singleResult, {
+                    personaId,
+                    text: trimmed,
+                    applyPronunciation,
+                    configRevision: currentRevision,
+                })
+            ) {
+                const fallback = `${personaName || personaId}_${formatTimestamp()}`;
+                const saveName = sanitizeWavFilename(singleFilename, fallback);
+                triggerDownload(singleResult.blob, saveName);
+                return;
+            }
 
             const res = await fetch(`${addonApiBase}/synthesize`, {
                 method: "POST",
@@ -260,6 +272,7 @@ export default function VoiceTtsPersonaPanel({
                 personaId,
                 text: trimmed,
                 applyPronunciation,
+                configRevision: currentRevision,
                 blob,
                 objectUrl,
                 engine,
@@ -294,10 +307,30 @@ export default function VoiceTtsPersonaPanel({
     }, [
         addonApiBase,
         applyPronunciation,
+        configRevision,
         flushPendingSaves,
+        getConfigRevision,
         personaId,
         personaName,
         singleFilename,
+        singleResult,
+        singleText,
+    ]);
+
+    const isSingleResultStale = useMemo(() => {
+        if (!singleResult) return false;
+        const latestRev = getConfigRevision?.() ?? configRevision ?? null;
+        return !canReuseSingleSynthCache(singleResult, {
+            personaId,
+            text: singleText.trim(),
+            applyPronunciation,
+            configRevision: latestRev,
+        });
+    }, [
+        applyPronunciation,
+        configRevision,
+        getConfigRevision,
+        personaId,
         singleResult,
         singleText,
     ]);
@@ -638,6 +671,11 @@ export default function VoiceTtsPersonaPanel({
                             {singleResult.appliedText !== singleResult.text && (
                                 <div style={styles.appliedTextHint}>
                                     読み上げ文 (辞書/整形後): {singleResult.appliedText}
+                                </div>
+                            )}
+                            {isSingleResultStale && (
+                                <div style={styles.appliedTextHint}>
+                                    ※設定またはテキストが変更されています (次の再生・WAV 保存で新しく合成されます)
                                 </div>
                             )}
                         </div>

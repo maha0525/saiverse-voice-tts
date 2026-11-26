@@ -91,6 +91,16 @@ const used = new Set(["manifest.json"]);
 assert.equal(zb.allocateUniqueWavName("Hi.wav", used), "Hi.wav");
 assert.equal(zb.allocateUniqueWavName("hi.wav", used), "hi_2.wav");
 
+// 4b. Single-preview WAV cache invalidation when configRevision changes or is absent
+const baseKey = { personaId: "air_city_a", text: "おはよう", applyPronunciation: true, configRevision: 3 };
+assert.equal(zb.canReuseSingleSynthCache(baseKey, { ...baseKey }), true);
+assert.equal(zb.canReuseSingleSynthCache(baseKey, { ...baseKey, configRevision: 4 }), false);
+assert.equal(zb.canReuseSingleSynthCache(baseKey, { ...baseKey, configRevision: null }), false);
+assert.equal(zb.canReuseSingleSynthCache({ ...baseKey, configRevision: null }, { ...baseKey, configRevision: null }), false);
+assert.equal(zb.canReuseSingleSynthCache(baseKey, { ...baseKey, text: "こんにちは" }), false);
+assert.equal(zb.canReuseSingleSynthCache(baseKey, { ...baseKey, applyPronunciation: false }), false);
+assert.equal(zb.canReuseSingleSynthCache(baseKey, { ...baseKey, personaId: "yui_city_a" }), false);
+
 // 5. Build a ZIP with ASCII + Japanese UTF-8 filenames and binary WAV-like data
 const wavData = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00]);
 const manifestData = new TextEncoder().encode(JSON.stringify({ ok: true, label: "日本語" }));

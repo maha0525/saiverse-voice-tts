@@ -22,6 +22,37 @@ export interface BatchParseResult {
     error: string | null;
 }
 
+export interface SingleSynthCacheKey {
+    personaId: string;
+    text: string;
+    applyPronunciation: boolean;
+    configRevision: number | null;
+}
+
+/**
+ * Decide whether a previously synthesized preview WAV can be reused for saving.
+ *
+ * Requires a non-null `configRevision` from the host so that any edit to
+ * persona/global voice settings (Voice ID, engine, reference audio, speed,
+ * pronunciation dictionary, etc.) invalidates the cached audio. When the host
+ * does not supply a revision (`null`), fail closed and force re-synthesis.
+ */
+export function canReuseSingleSynthCache(
+    cached: SingleSynthCacheKey | null | undefined,
+    current: SingleSynthCacheKey,
+): boolean {
+    if (!cached) return false;
+    if (cached.configRevision === null || current.configRevision === null) {
+        return false;
+    }
+    return (
+        cached.configRevision === current.configRevision &&
+        cached.personaId === current.personaId &&
+        cached.text === current.text &&
+        cached.applyPronunciation === current.applyPronunciation
+    );
+}
+
 export const BATCH_MAX_ITEMS = 200;
 
 const INVALID_FILENAME_CHARS_RE = /[<>:"/\\|?*\x00-\x1f\x7f]/g;
