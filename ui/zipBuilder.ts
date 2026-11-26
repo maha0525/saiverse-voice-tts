@@ -128,8 +128,19 @@ export function sanitizeWavFilename(raw: string | null | undefined, fallbackStem
         text = safeFallback;
     }
     text = truncateUtf8Bytes(text, MAX_STEM_UTF8_BYTES).replace(/[ ._]+$/g, "") || safeFallback;
-    if (WINDOWS_RESERVED_STEMS.has(text.toUpperCase())) {
-        text = `${text}_`;
+    const dotIdx = text.indexOf(".");
+    const head = dotIdx >= 0 ? text.slice(0, dotIdx) : text;
+    const tail = dotIdx >= 0 ? text.slice(dotIdx) : "";
+    const trimmedHead = head.replace(/ +$/g, "");
+    if (WINDOWS_RESERVED_STEMS.has(trimmedHead.toUpperCase())) {
+        if (tail) {
+            const escaped = `${trimmedHead}_${tail}`;
+            text =
+                truncateUtf8Bytes(escaped, MAX_STEM_UTF8_BYTES).replace(/[ .]+$/g, "") ||
+                `${trimmedHead}_`;
+        } else {
+            text = `${trimmedHead}_`;
+        }
     }
     return `${text}.wav`;
 }

@@ -464,8 +464,14 @@ def _sanitize_wav_filename(raw: Any, fallback_stem: str) -> str:
     if not text:
         text = safe_fallback
     text = _truncate_utf8_bytes(text, _MAX_STEM_UTF8_BYTES).rstrip(" ._") or safe_fallback
-    if text.upper() in _WINDOWS_RESERVED_STEMS:
-        text = f"{text}_"
+    head, sep, tail = text.partition(".")
+    trimmed_head = head.rstrip(" ")
+    if trimmed_head.upper() in _WINDOWS_RESERVED_STEMS:
+        if sep:
+            escaped = f"{trimmed_head}_{sep}{tail}"
+            text = _truncate_utf8_bytes(escaped, _MAX_STEM_UTF8_BYTES).rstrip(" .") or f"{trimmed_head}_"
+        else:
+            text = f"{trimmed_head}_"
     return f"{text}.wav"
 
 

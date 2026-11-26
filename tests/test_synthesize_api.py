@@ -94,6 +94,14 @@ class FilenameSanitizationTests(unittest.TestCase):
             "CON_.wav",
         )
         self.assertEqual(
+            self.api._sanitize_wav_filename("CON.greeting", "001"),
+            "CON_.greeting.wav",
+        )
+        self.assertEqual(
+            self.api._sanitize_wav_filename("aux.en.wav", "001"),
+            "aux_.en.wav",
+        )
+        self.assertEqual(
             self.api._sanitize_wav_filename("greeting.wav", "001"),
             "greeting.wav",
         )

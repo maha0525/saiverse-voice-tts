@@ -87,6 +87,8 @@ assert.ok(r4.error);
 // 4. Filename sanitization, UTF-8 byte bounds & deduplication
 assert.equal(zb.sanitizeWavFilename("../a/b:c", "001"), "a_b_c.wav");
 assert.equal(zb.sanitizeWavFilename("CON", "001"), "CON_.wav");
+assert.equal(zb.sanitizeWavFilename("CON.greeting", "001"), "CON_.greeting.wav");
+assert.equal(zb.sanitizeWavFilename("aux.en.wav", "001"), "aux_.en.wav");
 const longJp = zb.sanitizeWavFilename("あ".repeat(100), "001");
 assert.equal(longJp, "あ".repeat(66) + ".wav");
 assert.ok(zb.utf8ByteLength(longJp) <= 204);
